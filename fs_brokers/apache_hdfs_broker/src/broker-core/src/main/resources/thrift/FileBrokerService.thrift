@@ -1,1 +1,0 @@
-../../../../../../../../gensrc/thrift/FileBrokerService.thrift
