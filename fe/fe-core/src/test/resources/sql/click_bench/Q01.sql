@@ -1,2 +1,0 @@
--- Q01
-SELECT COUNT(*) FROM hits;

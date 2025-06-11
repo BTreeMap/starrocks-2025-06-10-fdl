@@ -1,2 +1,0 @@
--- Q05
-SELECT COUNT(DISTINCT UserID) FROM hits;
