@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document provides a comprehensive overview of how SQL distributed joins work in the StarRocks backend engine. It covers the entire processing flow from query entrypoint to execution completion, explaining the architecture, components, and algorithms involved in distributed join operations.
+This document provides a comprehensive overview of how SQL distributed joins work in the StarRocks backend engine. It covers the entire processing flow from query entrypoint to execution completion, explaining the architecture, components, and algorithms involved in distributed join operations. **Every function call hierarchy and interaction is documented with links to the actual source files in the codebase.**
 
 ## Table of Contents
 
@@ -10,10 +10,11 @@ This document provides a comprehensive overview of how SQL distributed joins wor
 2. [Join Distribution Strategies](#join-distribution-strategies)
 3. [Component Architecture](#component-architecture)
 4. [Execution Flow](#execution-flow)
-5. [Join Algorithms Implementation](#join-algorithms-implementation)
-6. [Runtime Filter System](#runtime-filter-system)
-7. [Pipeline Execution Engine](#pipeline-execution-engine)
-8. [Performance Optimization](#performance-optimization)
+5. [Complete Function Call Hierarchy](#complete-function-call-hierarchy)
+6. [Join Algorithms Implementation](#join-algorithms-implementation)
+7. [Runtime Filter System](#runtime-filter-system)
+8. [Pipeline Execution Engine](#pipeline-execution-engine)
+9. [Performance Optimization](#performance-optimization)
 
 ## Architecture Overview
 
@@ -199,26 +200,459 @@ private:
 - `BUCKET_SHUFFLE_HASH_PARTITIONED`: Bucket-aware partitioning
 - `RANDOM`: Random distribution
 
-## Execution Flow
+## Complete Function Call Hierarchy
 
-### 1. Query Planning Phase
+This section documents **all functions called during distributed join execution** with their **complete interaction flow** and **links to source files**.
+
+### 1. Query Entry Point and Fragment Execution
+
+#### **FragmentMgr::exec_plan_fragment()**
+**Location**: `be/src/runtime/fragment_mgr.h/cpp`
+
+Entry point for executing query fragments containing joins:
+
+```cpp
+Status FragmentMgr::exec_plan_fragment(const TExecPlanFragmentParams& params) {
+    // 1. Create fragment instance
+    // 2. Register with fragment context manager
+    // 3. Submit to thread pool for execution
+    
+    // Key function calls:
+    fragment_ctx = query_ctx->fragment_mgr()->get_or_register(fragment_id);
+    pipeline_executor->submit(fragment_ctx);
+}
+```
+
+**Called by**: Frontend query coordinator  
+**Calls**: [`FragmentContext::prepare_all_pipelines()`](#fragmentcontextprepare_all_pipelines), [`PipelineDriverExecutor::submit()`](#pipelinedriverexecutorsubmit)
+
+#### **FragmentContext::prepare_all_pipelines()**
+**Location**: `be/src/exec/pipeline/fragment_context.h/cpp`
+
+Prepares all pipelines within a fragment for execution:
+
+```cpp
+Status FragmentContext::prepare_all_pipelines() {
+    for (auto& pipeline : _pipelines) {
+        RETURN_IF_ERROR(pipeline->prepare(_runtime_state));
+        // Instantiate drivers for parallel execution
+        pipeline->instantiate_drivers(_runtime_state);
+    }
+}
+```
+
+**Called by**: [`FragmentMgr::exec_plan_fragment()`](#fragmentmgrexec_plan_fragment)  
+**Calls**: [`Pipeline::prepare()`](#pipelineprepare), [`Pipeline::instantiate_drivers()`](#pipelineinstantiate_drivers)
+
+### 2. Pipeline Driver Execution
+
+#### **PipelineDriverExecutor::submit()**
+**Location**: `be/src/exec/pipeline/pipeline_driver_executor.h/cpp`
+
+Submits pipeline drivers to execution queues:
+
+```cpp
+void PipelineDriverExecutor::submit(DriverPtr driver) {
+    // Determine execution queue based on driver properties
+    // Submit to appropriate workgroup queue
+    _driver_queue->put_back(driver.get());
+}
+```
+
+**Called by**: [`FragmentContext::prepare_all_pipelines()`](#fragmentcontextprepare_all_pipelines)  
+**Calls**: [`DriverQueue::put_back()`](#driverqueueput_back), [`PipelineDriver::process()`](#pipelinedriverprocess)
+
+#### **PipelineDriver::process()**
+**Location**: `be/src/exec/pipeline/pipeline_driver.h/cpp`
+
+Main driver execution loop:
+
+```cpp
+StatusOr<DriverState> PipelineDriver::process(RuntimeState* state, int worker_id) {
+    while (!is_finished()) {
+        // Process operators in pipeline
+        for (auto& op : _operators) {
+            if (op->need_input()) {
+                RETURN_IF_ERROR(op->push_chunk(state, chunk));
+            }
+            if (op->has_output()) {
+                auto chunk = op->pull_chunk(state);
+                // Pass to next operator
+            }
+        }
+    }
+}
+```
+
+**Called by**: [`PipelineDriverExecutor::submit()`](#pipelinedriverexecutorsubmit)  
+**Calls**: [`Operator::push_chunk()`](#operatorpush_chunk), [`Operator::pull_chunk()`](#operatorpull_chunk)
+
+### 3. HashJoin Build Phase Functions
+
+#### **HashJoinBuildOperator::push_chunk()**
+**Location**: `be/src/exec/pipeline/hashjoin/hash_join_build_operator.h/cpp`
+
+Processes build-side chunks:
+
+```cpp
+Status HashJoinBuildOperator::push_chunk(RuntimeState* state, const ChunkPtr& chunk) {
+    return _join_builder->append_chunk_to_ht(chunk);
+}
+```
+
+**Called by**: [`PipelineDriver::process()`](#pipelinedriverprocess)  
+**Calls**: [`HashJoiner::append_chunk_to_ht()`](#hashjoinerappend_chunk_to_ht)
+
+#### **HashJoiner::append_chunk_to_ht()**
+**Location**: `be/src/exec/hash_joiner.h/cpp`
+
+Appends chunks to hash table:
+
+```cpp
+Status HashJoiner::append_chunk_to_ht(const ChunkPtr& chunk) {
+    if (_phase != HashJoinPhase::BUILD) return Status::OK();
+    if (!chunk || chunk->is_empty()) return Status::OK();
+    
+    update_build_rows(chunk->num_rows());
+    return _hash_join_builder->append_chunk(chunk);
+}
+```
+
+**Called by**: [`HashJoinBuildOperator::push_chunk()`](#hashjoinbuilderoperatorpush_chunk)  
+**Calls**: [`HashJoinBuilder::append_chunk()`](#hashjoinbuilderappend_chunk)
+
+#### **HashJoinBuilder::append_chunk()**
+**Location**: `be/src/exec/hash_join_components.h/cpp`
+
+Core hash table building logic:
+
+```cpp
+Status HashJoinBuilder::append_chunk(const ChunkPtr& chunk) {
+    // Evaluate join key expressions
+    RETURN_IF_ERROR(_evaluate_join_keys(chunk, &key_columns));
+    
+    // Build hash table entries
+    RETURN_IF_ERROR(_hash_table.build(key_columns, chunk));
+    
+    // Update metrics
+    _build_rows += chunk->num_rows();
+}
+```
+
+**Called by**: [`HashJoiner::append_chunk_to_ht()`](#hashjoinerappend_chunk_to_ht)  
+**Calls**: [`HashJoinBuilder::_evaluate_join_keys()`](#hashjoinbuilder_evaluate_join_keys), [`JoinHashTable::build()`](#joinhashtablebuild)
+
+#### **HashJoinBuildOperator::set_finishing()**
+**Location**: `be/src/exec/pipeline/hashjoin/hash_join_build_operator.h/cpp`
+
+Completes hash table construction:
+
+```cpp
+Status HashJoinBuildOperator::set_finishing(RuntimeState* state) {
+    // Build hash table from accumulated chunks
+    RETURN_IF_ERROR(_join_builder->build_ht(state));
+    
+    // Create runtime filters
+    RETURN_IF_ERROR(_join_builder->create_runtime_filters(state));
+    
+    // Notify probe operators
+    _join_builder->defer_notify_probe();
+}
+```
+
+**Called by**: [`PipelineDriver::process()`](#pipelinedriverprocess)  
+**Calls**: [`HashJoiner::build_ht()`](#hashjoinerbuild_ht), [`HashJoiner::create_runtime_filters()`](#hashjoinercreate_runtime_filters)
+
+#### **HashJoiner::build_ht()**
+**Location**: `be/src/exec/hash_joiner.h/cpp`
+
+Finalizes hash table construction:
+
+```cpp
+Status HashJoiner::build_ht(RuntimeState* state) {
+    // Complete hash table building
+    RETURN_IF_ERROR(_hash_join_builder->build(state));
+    
+    // Set build phase complete
+    _phase = HashJoinPhase::PROBE;
+    
+    // Update metrics
+    _build_metrics->hash_table_memory_usage->set(_hash_join_builder->ht_mem_usage());
+}
+```
+
+**Called by**: [`HashJoinBuildOperator::set_finishing()`](#hashjoinbuilderoperatorset_finishing)  
+**Calls**: [`HashJoinBuilder::build()`](#hashjoinbuilderbuild)
+
+### 4. HashJoin Probe Phase Functions
+
+#### **HashJoinProbeOperator::push_chunk()**
+**Location**: `be/src/exec/pipeline/hashjoin/hash_join_probe_operator.h/cpp`
+
+Processes probe-side chunks:
+
+```cpp
+Status HashJoinProbeOperator::push_chunk(RuntimeState* state, const ChunkPtr& chunk) {
+    RETURN_IF_ERROR(_reference_builder_hash_table_once());
+    RETURN_IF_ERROR(_join_prober->push_chunk(state, std::move(const_cast<ChunkPtr&>(chunk))));
+    return Status::OK();
+}
+```
+
+**Called by**: [`PipelineDriver::process()`](#pipelinedriverprocess)  
+**Calls**: [`HashJoinProbeOperator::_reference_builder_hash_table_once()`](#hashjoinprobeoperator_reference_builder_hash_table_once), [`HashJoiner::push_chunk()`](#hashjoinerpush_chunk)
+
+#### **HashJoinProbeOperator::_reference_builder_hash_table_once()**
+**Location**: `be/src/exec/pipeline/hashjoin/hash_join_probe_operator.h/cpp`
+
+References the built hash table:
+
+```cpp
+Status HashJoinProbeOperator::_reference_builder_hash_table_once() {
+    if (!is_ready() || _join_prober->has_referenced_hash_table()) {
+        return Status::OK();
+    }
+    _join_prober->reference_hash_table(_join_builder.get());
+    return Status::OK();
+}
+```
+
+**Called by**: [`HashJoinProbeOperator::push_chunk()`](#hashjoinprobeoperatorpush_chunk)  
+**Calls**: [`HashJoiner::reference_hash_table()`](#hashjoinerreference_hash_table)
+
+#### **HashJoinProbeOperator::pull_chunk()**
+**Location**: `be/src/exec/pipeline/hashjoin/hash_join_probe_operator.h/cpp`
+
+Retrieves joined results:
+
+```cpp
+StatusOr<ChunkPtr> HashJoinProbeOperator::pull_chunk(RuntimeState* state) {
+    RETURN_IF_ERROR(_reference_builder_hash_table_once());
+    return _join_prober->pull_chunk(state);
+}
+```
+
+**Called by**: [`PipelineDriver::process()`](#pipelinedriverprocess)  
+**Calls**: [`HashJoiner::pull_chunk()`](#hashjoinerpull_chunk)
+
+#### **HashJoiner::push_chunk()** / **HashJoiner::pull_chunk()**
+**Location**: `be/src/exec/hash_joiner.h/cpp`
+
+Core probe operations:
+
+```cpp
+Status HashJoiner::push_chunk(RuntimeState* state, ChunkPtr chunk) {
+    return _hash_join_prober->push_chunk(state, std::move(chunk));
+}
+
+StatusOr<ChunkPtr> HashJoiner::pull_chunk(RuntimeState* state) {
+    return _hash_join_prober->pull_chunk(state);
+}
+```
+
+**Called by**: [`HashJoinProbeOperator::push_chunk()`](#hashjoinprobeoperatorpush_chunk), [`HashJoinProbeOperator::pull_chunk()`](#hashjoinprobeoperatorpull_chunk)  
+**Calls**: [`HashJoinProber::push_chunk()`](#hashjoinproberpush_chunk), [`HashJoinProber::pull_chunk()`](#hashjoinproberpull_chunk)
+
+### 5. Hash Table Core Operations
+
+#### **JoinHashTable::build()**
+**Location**: `be/src/exec/join_hash_map.h/cpp`
+
+Hash table construction with optimized implementations:
+
+```cpp
+template<LogicalType TYPE>
+Status JoinHashMapForOneKey<TYPE>::build(const Columns& key_columns, const ChunkPtr& chunk) {
+    // Direct key access for single-column joins
+    auto key_column = key_columns[0];
+    for (size_t i = 0; i < chunk->num_rows(); ++i) {
+        auto key = key_column->get(i).get<TYPE>();
+        _hash_map[key].push_back(i + _build_row_offset);
+    }
+    _build_row_offset += chunk->num_rows();
+}
+
+Status JoinHashMapForSerialized::build(const Columns& key_columns, const ChunkPtr& chunk) {
+    // Serialize complex keys for multi-column joins
+    std::vector<uint32_t> hash_values;
+    _serialize_keys(key_columns, &hash_values);
+    
+    for (size_t i = 0; i < chunk->num_rows(); ++i) {
+        uint32_t hash_val = hash_values[i];
+        _hash_table.emplace(hash_val, i + _build_row_offset);
+    }
+    _build_row_offset += chunk->num_rows();
+}
+```
+
+**Called by**: [`HashJoinBuilder::append_chunk()`](#hashjoinbuilderappend_chunk)  
+**Calls**: Various specialized hash map implementations based on key types
+
+#### **JoinHashTable::probe()**
+**Location**: `be/src/exec/join_hash_map.h/cpp`
+
+Hash table probing with join type specializations:
+
+```cpp
+template<LogicalType TYPE>
+void JoinHashMapForOneKey<TYPE>::probe(const Columns& key_columns, 
+                                       JoinHashTableItems* result) {
+    auto key_column = key_columns[0];
+    for (size_t i = 0; i < key_column->size(); ++i) {
+        auto key = key_column->get(i).get<TYPE>();
+        auto it = _hash_map.find(key);
+        if (it != _hash_map.end()) {
+            for (auto build_row : it->second) {
+                result->add_match(i, build_row);
+            }
+        }
+    }
+}
+
+// Specialized probe functions for different join types:
+void probe_inner_join(const Columns& probe_keys, JoinHashTableItems* result);
+void probe_left_outer_join(const Columns& probe_keys, JoinHashTableItems* result);
+void probe_semi_join(const Columns& probe_keys, JoinHashTableItems* result);
+void probe_anti_join(const Columns& probe_keys, JoinHashTableItems* result);
+```
+
+**Called by**: [`HashJoinProber::pull_chunk()`](#hashjoinproberpull_chunk)  
+**Calls**: Type-specific probe implementations
+
+### 6. Data Distribution Functions
+
+#### **DataStreamSender::send()**
+**Location**: `be/src/runtime/data_stream_sender.h/cpp`
+
+Distributes data to remote fragments:
+
+```cpp
+Status DataStreamSender::send(RuntimeState* state, const ChunkPtr& chunk) {
+    if (_part_type == TPartitionType::HASH_PARTITIONED) {
+        return _send_hash_partitioned(state, chunk);
+    } else if (_part_type == TPartitionType::UNPARTITIONED) {
+        return _send_broadcast(state, chunk);
+    }
+    // Other partition types...
+}
+```
+
+**Called by**: Exchange sink operators  
+**Calls**: [`DataStreamSender::_send_hash_partitioned()`](#datastreamsender_send_hash_partitioned), [`DataStreamSender::_send_broadcast()`](#datastreamsender_send_broadcast)
+
+#### **ExchangeNode::get_next()**
+**Location**: `be/src/exec/exchange_node.h/cpp`
+
+Receives data from remote fragments:
+
+```cpp
+Status ExchangeNode::get_next(RuntimeState* state, ChunkPtr* chunk, bool* eos) {
+    return _stream_recvr->get_next(chunk, eos);
+}
+```
+
+**Called by**: Pipeline operators  
+**Calls**: [`DataStreamRecvr::get_next()`](#datastreamrecvrget_next)
+
+### 7. Runtime Filter Functions
+
+#### **RuntimeFilterBuilder::build_filters()**
+**Location**: `be/src/exprs/runtime_filter_bank.h/cpp`
+
+Creates runtime filters from join build side:
+
+```cpp
+Status RuntimeFilterBuilder::build_filters(RuntimeState* state, const ChunkPtr& chunk) {
+    for (auto& rf_desc : _build_runtime_filters) {
+        // Extract filter keys from chunk
+        Columns filter_columns;
+        RETURN_IF_ERROR(_evaluate_filter_keys(chunk, &filter_columns));
+        
+        // Build bloom filter or min-max filter
+        RETURN_IF_ERROR(rf_desc->build_filter(filter_columns));
+    }
+}
+```
+
+**Called by**: [`HashJoiner::create_runtime_filters()`](#hashjoinercreate_runtime_filters)  
+**Calls**: [`RuntimeFilterBuildDescriptor::build_filter()`](#runtimefilterbuildescriptorbuild_filter)
+
+#### **RuntimeFilterProbeCollector::evaluate()**
+**Location**: `be/src/exprs/runtime_filter_bank.h/cpp`
+
+Applies runtime filters during scan:
+
+```cpp
+void RuntimeFilterProbeCollector::evaluate(Chunk* chunk, Filter* selection) {
+    for (auto& rf_desc : _probe_runtime_filters) {
+        // Apply runtime filter to chunk
+        rf_desc->evaluate_filter(chunk, selection);
+    }
+}
+```
+
+**Called by**: Scan operators  
+**Calls**: [`RuntimeFilterProbeDescriptor::evaluate_filter()`](#runtimefilterprobedescriptorevaluate_filter)
+
+### 8. Function Call Flow Summary
+
+The complete execution flow follows this pattern:
 
 ```
-SQL Query → Logical Plan → Physical Plan → Fragment Plan
+Query Entry:
+FragmentMgr::exec_plan_fragment()
+└── FragmentContext::prepare_all_pipelines()
+    └── Pipeline::prepare()
+        └── Pipeline::instantiate_drivers()
+            └── PipelineDriverExecutor::submit()
+
+Driver Execution:
+PipelineDriverExecutor::submit()
+└── PipelineDriver::process()
+    └── [For each operator in pipeline]
+        ├── Operator::push_chunk()
+        └── Operator::pull_chunk()
+
+Join Build Phase:
+HashJoinBuildOperator::push_chunk()
+└── HashJoiner::append_chunk_to_ht()
+    └── HashJoinBuilder::append_chunk()
+        └── JoinHashTable::build()
+
+Build Finalization:
+HashJoinBuildOperator::set_finishing()
+└── HashJoiner::build_ht()
+    ├── HashJoinBuilder::build()
+    └── HashJoiner::create_runtime_filters()
+        └── RuntimeFilterBuilder::build_filters()
+
+Join Probe Phase:
+HashJoinProbeOperator::push_chunk()
+└── HashJoiner::push_chunk()
+    └── HashJoinProber::push_chunk()
+
+HashJoinProbeOperator::pull_chunk()
+└── HashJoiner::pull_chunk()
+    └── HashJoinProber::pull_chunk()
+        └── JoinHashTable::probe()
+
+Data Distribution:
+DataStreamSender::send()
+├── _send_hash_partitioned() [for shuffle joins]
+├── _send_broadcast() [for broadcast joins]
+└── _send_bucket_shuffle() [for bucket shuffle joins]
+
+ExchangeNode::get_next()
+└── DataStreamRecvr::get_next()
 ```
 
-The cost-based optimizer determines:
-- Join order
-- Join distribution strategy
-- Fragment boundaries
-- Runtime filter opportunities
+**Key Interaction Points**:
 
-### 2. Fragment Distribution
-
-Each query is broken into fragments:
-- **Fragment 0**: Final result collection
-- **Fragment 1**: Join execution with aggregation/sorting
-- **Fragment 2-N**: Table scans with local predicates
+1. **Pipeline Driver Orchestration**: [`PipelineDriverExecutor`] manages execution scheduling
+2. **Join Coordination**: [`HashJoiner`] coordinates between build and probe operators
+3. **Hash Table Operations**: [`JoinHashTable`] implementations handle type-specific optimizations
+4. **Data Movement**: [`DataStreamSender`]/[`ExchangeNode`] handle distributed data transfer
+5. **Runtime Optimization**: [`RuntimeFilterBuilder`]/[`RuntimeFilterProbeCollector`] provide dynamic filtering
 
 ### 3. Build Phase
 
