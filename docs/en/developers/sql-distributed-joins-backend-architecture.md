@@ -204,6 +204,13 @@ private:
 
 This section documents **all functions called during distributed join execution** with their **complete interaction flow** and **links to source files**.
 
+### Function Call List
+Below is the comprehensive list of core functions invoked during a distributed join execution, with direct links to their source files:
+- [FragmentMgr::exec_plan_fragment()](be/src/runtime/fragment_mgr.h) → Implements fragment dispatch and lifecycle (see `fragment_mgr.cpp` for definition)
+- [FragmentContext::prepare_all_pipelines()](be/src/exec/pipeline/fragment_context.h) → Prepares and instantiates pipelines within a fragment
+- [PipelineDriverExecutor::submit()](be/src/exec/pipeline/pipeline_driver_executor.h) → Enqueues drivers for execution in the driver executor
+- [PipelineDriver::process()](be/src/exec/pipeline/pipeline_driver.h) → Main execution loop for pipeline drivers
+
 ### 1. Query Entry Point and Fragment Execution
 
 #### **FragmentMgr::exec_plan_fragment()**
