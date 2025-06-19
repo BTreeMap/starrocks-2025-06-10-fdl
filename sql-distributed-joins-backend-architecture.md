@@ -5,7 +5,7 @@
 This document provides a comprehensive overview of how SQL distributed joins work in the StarRocks backend engine. It covers the entire processing flow from query entrypoint to execution completion, explaining the architecture, components, and algorithms involved in distributed join operations. **Every function call hierarchy and interaction is documented with links to the actual source files in the codebase.**
 
 **Verification Status**: ✅ All implementation details verified against source code  
-**Last Updated**: December 2024  
+**Last Updated**: June 2025  
 **Source Files Verified**: 150+ core files examined
 
 ## Table of Contents
