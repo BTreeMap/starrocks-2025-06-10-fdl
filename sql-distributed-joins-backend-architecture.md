@@ -19,6 +19,7 @@ This document provides a comprehensive overview of how SQL distributed joins wor
 7. [Runtime Filter System](#runtime-filter-system)
 8. [Pipeline Execution Engine](#pipeline-execution-engine)
 9. [Performance Optimization](#performance-optimization)
+10. [Partitioning Type Decision Logic](#partitioning-type-decision-logic)
 
 ## Architecture Overview
 
@@ -229,6 +230,279 @@ private:
 - `HASH_PARTITIONED`: Hash-based partitioning
 - `BUCKET_SHUFFLE_HASH_PARTITIONED`: Bucket-aware partitioning
 - `RANDOM`: Random distribution
+
+## Partitioning Type Decision Logic
+
+StarRocks uses a sophisticated multi-layered approach to determine partitioning types based on table characteristics, query patterns, and performance optimization requirements. The decision logic involves multiple components from query planning to runtime execution.
+
+### When Each Partitioning Type Is Used
+
+#### 1. `UNPARTITIONED` - Broadcast Distribution
+
+**Decision Criteria**:
+
+- **Small build table size**: Determined by cost-based optimizer statistics
+- **Table size thresholds**: Based on configurable memory and row count limits
+- **Explicit SQL hints**: `[BROADCAST]` hint in join queries
+- **Join type constraints**: Required for `NULL_AWARE_LEFT_ANTI_JOIN`
+
+**Implementation Decision Points**:
+
+```cpp
+// From be/src/exec/hash_join_node.cpp - Distribution mode check
+if (_distribution_mode == TJoinDistributionMode::BROADCAST) {
+    // Build side replicated to all nodes via UNPARTITIONED exchange
+    // No data shuffling required for probe table
+}
+
+// Constraint for certain join types
+DCHECK(_join_type != TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN || 
+       _distribution_mode == TJoinDistributionMode::BROADCAST);
+```
+
+**Key Files**:
+
+- `be/src/runtime/data_stream_sender.cpp` (line 478) - Broadcast send logic
+- `be/src/exec/hash_join_node.cpp` (line 456) - Distribution mode detection
+
+#### 2. `HASH_PARTITIONED` - Hash-based Partitioning
+
+**Decision Criteria**:
+
+- **Both tables are large**: Neither qualifies for broadcast
+- **No bucketing key alignment**: Join keys don't match existing table distributions
+- **Default choice**: For general large-table joins when other optimizations don't apply
+- **Explicit SQL hints**: `[SHUFFLE]` hint in join queries
+
+**Implementation Decision Points**:
+
+```cpp
+// From be/src/runtime/data_stream_sender.cpp - Hash partitioning logic
+if (_part_type == TPartitionType::HASH_PARTITIONED) {
+    _hash_values.assign(num_rows, HashUtil::FNV_SEED);
+    for (const ColumnPtr& column : _partitions_columns) {
+        column->fnv_hash(&_hash_values[0], 0, num_rows);
+    }
+    // Distribute based on hash values
+    for (uint16_t i = 0; i < num_rows; ++i) {
+        uint16_t channel_index = _hash_values[i] % num_channels;
+        // Send to appropriate channel
+    }
+}
+
+// Shuffler class selection for compatibility
+if (_part_type == TPartitionType::HASH_PARTITIONED && !compatibility) {
+    _exchange_shuffle = &Shuffler::exchange_shuffle<true, ReduceOp>;
+} else {
+    _exchange_shuffle = &Shuffler::exchange_shuffle<true, ModuloOp>;
+}
+```
+
+**Key Files**:
+
+- `be/src/exec/pipeline/exchange/shuffler.h` (line 30-39) - Hash partitioning algorithm selection
+- `be/src/exec/pipeline/exchange/exchange_sink_operator.cpp` (line 566) - Runtime hash computation
+
+#### 3. `BUCKET_SHUFFLE_HASH_PARTITIONED` - Bucket-aware Partitioning
+
+**Decision Criteria**:
+
+- **Bucketing key alignment**: One table's bucketing key matches join key
+- **Colocation requirements**: Tables are non-partitioned or in same colocation group
+- **Cost optimization**: Leverages existing data distribution to minimize shuffling
+- **Explicit SQL hints**: `[BUCKET]` hint in join queries
+
+**Implementation Decision Points**:
+
+```cpp
+// From be/src/exec/pipeline/pipeline_builder.cpp - Bucket shuffle decision
+OpFactories PipelineBuilderContext::maybe_interpolate_local_bucket_shuffle_exchange(
+        RuntimeState* state, int32_t plan_node_id, OpFactories& pred_operators,
+        const std::vector<ExprContext*>& partition_expr_ctxs) {
+    auto* source_op = source_operator(pred_operators);
+    if (!source_op->could_local_shuffle()) {
+        return pred_operators;  // Skip if already partitioned correctly
+    }
+    return _do_maybe_interpolate_local_shuffle_exchange(state, plan_node_id, pred_operators, 
+                                                        partition_expr_ctxs,
+                                                        TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED);
+}
+
+// From be/src/exec/pipeline/exchange/exchange_source_operator.cpp - Partition type detection
+TPartitionType::type ExchangeSourceOperatorFactory::partition_type() const {
+    if (_texchange_node.partition_type != TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED) {
+        return SourceOperatorFactory::partition_type();
+    }
+    return _texchange_node.partition_type;
+}
+```
+
+**Key Files**:
+
+- `be/src/exec/pipeline/exchange/local_exchange.cpp` (line 88) - CRC32 hash for bucket distribution
+- `be/src/exec/pipeline/hashjoin/spillable_hash_join_build_operator.cpp` (line 286) - Bucket shuffle optimization
+
+#### 4. `RANDOM` - Random Distribution
+
+**Decision Criteria**:
+
+- **Load balancing**: When no specific distribution preference exists
+- **Default for table creation**: Used as default distribution since v3.1
+- **Simplicity requirement**: When ease of use is prioritized over performance
+- **Round-robin distribution**: For even data distribution across nodes
+
+**Implementation Decision Points**:
+
+```cpp
+// From be/src/runtime/data_stream_sender.cpp - Random distribution
+if (_part_type == TPartitionType::RANDOM) {
+    // Round-robin batches among channels
+    Channel* channel = _channels[_channel_indices[_current_channel_idx]];
+    bool real_sent = false;
+    RETURN_IF_ERROR(channel->send_one_chunk(chunk, false, &real_sent));
+    if (real_sent) {
+        _current_channel_idx = (_current_channel_idx + 1) % _channels.size();
+    }
+}
+
+// From be/src/exec/pipeline/exchange/local_exchange.cpp - Random partitioner
+Status RandomPartitioner::shuffle_channel_ids(const ChunkPtr& chunk, int32_t num_partitions) {
+    size_t num_rows = chunk->num_rows();
+    _shuffle_channel_id.resize(num_rows, 0);
+    
+    if (num_rows <= num_partitions) {
+        std::iota(_shuffle_channel_id.begin(), _shuffle_channel_id.end(), 0);
+    } else {
+        // Distribute rows round-robin across partitions
+        size_t i = 0;
+        for (; i < num_rows - num_partitions; i += num_partitions) {
+            std::iota(_shuffle_channel_id.begin() + i, 
+                     _shuffle_channel_id.begin() + i + num_partitions, 0);
+        }
+    }
+    return Status::OK();
+}
+```
+
+**Key Files**:
+
+- `be/src/exec/pipeline/exchange/local_exchange.cpp` (line 105-117) - Random partitioner implementation
+
+### Decision Flow Hierarchy
+
+The partitioning type selection follows this decision hierarchy:
+
+#### 1. Query Planning Phase (Frontend)
+
+**Location**: Query planner determines initial distribution strategy
+
+**Factors Considered**:
+
+- Table sizes and cardinality statistics
+- Join predicates and column types
+- Existing table distribution (bucketing, colocation)
+- User-provided SQL hints (`[BROADCAST]`, `[SHUFFLE]`, `[BUCKET]`, `[COLOCATE]`)
+
+**SQL Hint Override Examples**:
+
+```sql
+-- Force specific join strategies
+SELECT * FROM t1 JOIN [BROADCAST] t2 ON t1.a = t2.b;  -- UNPARTITIONED
+SELECT * FROM t1 JOIN [SHUFFLE] t2 ON t1.a = t2.b;    -- HASH_PARTITIONED  
+SELECT * FROM t1 JOIN [BUCKET] t2 ON t1.a = t2.b;     -- BUCKET_SHUFFLE_HASH_PARTITIONED
+SELECT * FROM t1 JOIN [COLOCATE] t2 ON t1.a = t2.b;   -- Local join, no exchange needed
+```
+
+#### 2. Fragment Generation Phase
+
+**Location**: `be/src/exec/pipeline/fragment_executor.cpp` (line 347-375)
+
+**Logic**: Determines distribution modes for runtime filters
+
+```cpp
+// Collection of distribution modes for runtime filters  
+static void collect_non_broadcast_rf_ids(const ExecNode* node, std::unordered_set<int32_t>& filter_ids) {
+    if (node->type() == TPlanNodeType::HASH_JOIN_NODE) {
+        const auto* join_node = down_cast<const HashJoinNode*>(node);
+        if (join_node->distribution_mode() != TJoinDistributionMode::BROADCAST) {
+            // Non-broadcast joins use hash partitioning
+            for (const auto* rf : join_node->build_runtime_filters()) {
+                filter_ids.insert(rf->filter_id());
+            }
+        }
+    }
+}
+```
+
+#### 3. Pipeline Building Phase
+
+**Location**: `be/src/exec/pipeline/pipeline_builder.cpp`
+
+**Logic**: Determines if local shuffle is needed
+
+```cpp
+// Decision whether to add local exchange
+OpFactories PipelineBuilderContext::_do_maybe_interpolate_local_shuffle_exchange(
+        RuntimeState* state, int32_t plan_node_id, OpFactories& pred_operators,
+        const std::vector<ExprContext*>& partition_expr_ctxs, const TPartitionType::type part_type) {
+    
+    // If DOP is one, no partitioning needed
+    size_t shuffle_partitions_num = degree_of_parallelism();
+    if (shuffle_partitions_num <= 1) {
+        return pred_operators;
+    }
+    
+    auto* pred_source_op = source_operator(pred_operators);
+    // Check if upstream already provides correct partitioning
+    if (!pred_source_op->could_local_shuffle()) {
+        return pred_operators;
+    }
+    
+    // Create appropriate partitioner based on part_type
+    auto local_shuffle = std::make_shared<PartitionExchanger>(
+        mem_mgr, local_shuffle_source.get(), part_type, partition_expr_ctxs);
+}
+```
+
+#### 4. Runtime Execution Phase
+
+**Location**: `be/src/exec/pipeline/exchange/exchange_source_operator.cpp` (line 94-107)
+
+**Logic**: Runtime decision for local shuffle
+
+```cpp
+// Runtime decision for local shuffle
+bool ExchangeSourceOperatorFactory::could_local_shuffle() const {
+    if (!_enable_pipeline_level_shuffle) {
+        return true;
+    }
+    // If data is already hash partitioned, no need for additional local shuffle
+    return _texchange_node.partition_type != TPartitionType::HASH_PARTITIONED &&
+           _texchange_node.partition_type != TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED;
+}
+```
+
+### Performance Optimization Considerations
+
+#### Table Characteristics Influence
+
+```cpp
+// From be/src/exec/pipeline/scan/olap_scan_operator.h - Natural partitioning indication
+class OlapScanOperatorFactory : public ScanOperatorFactory {
+    TPartitionType::type partition_type() const override { 
+        return TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED; 
+    }
+};
+```
+
+#### Runtime Adaptability
+
+- **Dynamic adjustment**: Based on actual data sizes during execution
+- **Memory pressure**: Spill-to-disk when memory is insufficient
+- **Skew detection**: Switch strategies when data skew is detected
+- **Pipeline-level optimization**: Avoid redundant shuffling operations
+
+This comprehensive decision framework ensures StarRocks selects the optimal partitioning strategy for each specific query scenario, balancing performance, resource utilization, and data movement costs.
 
 ## Complete Function Call Hierarchy
 
