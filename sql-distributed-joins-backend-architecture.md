@@ -1,4 +1,4 @@
-# SQL Distributed Joins Backend Architecture in StarRocks
+# SQL Distributed Joins Backend Architecture
 
 ## Overview
 

@@ -1,4 +1,4 @@
-# StarRocks Communication/RPC Layer in Distributed Joins: A Deep Dive
+# StarRocks Communication/RPC Layer in Distributed Joins
 
 ## Executive Summary
 
