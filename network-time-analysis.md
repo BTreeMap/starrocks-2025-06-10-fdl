@@ -193,3 +193,253 @@ NetworkTime includes serialization overhead, which means:
 ### Conclusion
 
 NetworkTime provides a comprehensive view of data exchange performance in StarRocks, including both network latency and serialization overhead while excluding receiver-side processing. This design allows for accurate bottleneck identification in distributed query execution, helping distinguish between network-related performance issues and local computation overhead.
+
+### Advanced Network Time Breakdown and Measurement Techniques
+
+While the current NetworkTime metric provides valuable insight into distributed query performance, it aggregates several components into a single measurement. This section explores techniques to break down NetworkTime into more granular metrics for deeper performance analysis.
+
+#### Current NetworkTime Composition Analysis
+
+Based on the implementation, NetworkTime currently includes:
+
+1. **Sender-side Serialization** (✅ Included)
+   - Protobuf message serialization (`request.params->SerializeToZeroCopyStream()`)
+   - Data compression (if enabled)
+   - BRPC request preparation and attachment handling
+
+2. **Network Stack Processing** (✅ Included)
+   - TCP socket send/receive buffer operations
+   - Kernel network stack processing (IP routing, TCP congestion control)
+   - Network device driver queuing and transmission
+   - Physical network transmission time
+
+3. **BRPC Framework Overhead** (✅ Included)
+   - Connection management and multiplexing
+   - Request/response correlation and routing
+   - BRPC internal queuing and scheduling
+
+4. **Receiver-side Processing** (❌ Excluded)
+   - Message deserialization
+   - Chunk processing and queuing
+   - Application-level response preparation
+
+#### Proposed Enhanced Measurement Framework
+
+##### 1. Single-Way Time Decomposition
+
+To separate round-trip time into directional components, additional timestamps could be added:
+
+```cpp
+// Enhanced timing points in sink_buffer.cpp
+struct DetailedNetworkTiming {
+    int64_t send_timestamp;           // Current: RPC closure creation
+    int64_t serialization_complete;   // NEW: After SerializeToZeroCopyStream()
+    int64_t kernel_send_timestamp;    // NEW: After successful send() syscall
+    int64_t kernel_recv_timestamp;    // NEW: When response arrives at kernel
+    int64_t response_timestamp;       // Current: Response received
+    int64_t receiver_process_time;    // Current: From receiver
+};
+
+// Example implementation locations:
+// File: be/src/exec/pipeline/exchange/sink_buffer.cpp
+void SinkBuffer::_send_rpc_with_detailed_timing(...) {
+    timing.send_timestamp = MonotonicNanos();
+    
+    // Serialize request
+    request.params->SerializeToZeroCopyStream(&wrapper);
+    timing.serialization_complete = MonotonicNanos();
+    
+    // BRPC call with custom completion callback
+    stub->transmit_chunk(&closure->cntl, request.params, &closure->response, closure);
+    // Could hook into BRPC's OnSendComplete callback for kernel_send_timestamp
+}
+```
+
+**Derived Metrics:**
+
+- `SerializationTime = serialization_complete - send_timestamp`
+- `KernelSendTime = kernel_send_timestamp - serialization_complete`
+- `NetworkRoundTripTime = kernel_recv_timestamp - kernel_send_timestamp`
+- `BRPCOverhead = response_timestamp - kernel_recv_timestamp`
+
+##### 2. eBPF-based Network Stack Instrumentation
+
+eBPF programs can provide kernel-level visibility into network performance:
+
+```c
+// Example eBPF program for TCP timing analysis
+// File: tools/network_analysis/tcp_timing.bpf.c
+struct tcp_timing_event {
+    __u64 timestamp;
+    __u32 pid;
+    __u32 src_ip, dst_ip;
+    __u16 src_port, dst_port;
+    __u32 seq_num;
+    __u8 event_type; // SEND_ENTRY, SEND_EXIT, RECV_ENTRY, RECV_EXIT
+};
+
+// Hook into TCP send path
+SEC("kprobe/tcp_sendmsg")
+int trace_tcp_send_entry(struct pt_regs *ctx) {
+    // Capture when StarRocks data enters TCP send path
+    struct tcp_timing_event event = {
+        .timestamp = bpf_ktime_get_ns(),
+        .event_type = SEND_ENTRY,
+        // ... extract connection details
+    };
+    bpf_perf_event_output(ctx, &tcp_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+    return 0;
+}
+
+// Hook into TCP receive path  
+SEC("kprobe/tcp_recvmsg")
+int trace_tcp_recv_entry(struct pt_regs *ctx) {
+    // Capture when response data arrives at TCP layer
+    // ... similar implementation
+}
+```
+
+**eBPF Insights Available:**
+
+- **TCP Queue Times**: Time spent in send/receive buffers
+- **Congestion Control Events**: Slow start, fast retransmit, ECN marking
+- **Packet Retransmissions**: Network reliability issues
+- **Interrupt Processing**: Time from NIC interrupt to user space
+- **CPU Scheduling Delays**: Impact of system load on network processing
+
+##### 3. BRPC Framework Instrumentation
+
+Enhanced timing within BRPC components:
+
+```cpp
+// Enhanced BRPC timing hooks
+// File: Custom BRPC instrumentation layer
+class StarRocksNetworkProfiler {
+public:
+    struct BRPCTiming {
+        int64_t connection_acquire_time;
+        int64_t request_queue_time;
+        int64_t send_buffer_time;
+        int64_t response_parse_time;
+    };
+    
+    // Hook into BRPC Controller lifecycle
+    void OnRequestStart(brpc::Controller* cntl) {
+        auto* timing = new BRPCTiming();
+        timing->connection_acquire_time = MonotonicNanos();
+        cntl->set_private_data(timing);
+    }
+    
+    void OnSendComplete(brpc::Controller* cntl) {
+        auto* timing = static_cast<BRPCTiming*>(cntl->private_data());
+        timing->send_buffer_time = MonotonicNanos();
+    }
+};
+```
+
+##### 4. Kernel Network Stack Deep Dive
+
+Integration with kernel tracing for comprehensive network analysis:
+
+```bash
+# Example: Using ftrace for network stack analysis
+echo 'function_graph' > /sys/kernel/debug/tracing/current_tracer
+echo '__netif_receive_skb_core' > /sys/kernel/debug/tracing/set_graph_function
+echo 'tcp_sendmsg' >> /sys/kernel/debug/tracing/set_graph_function
+
+# Monitor StarRocks network activity
+cat /sys/kernel/debug/tracing/trace_pipe | grep -E "(starrocks|PID_OF_BE_PROCESS)"
+```
+
+**Kernel-level Metrics:**
+
+- **Network Device Queue Delays**: Time in device driver TX/RX queues
+- **Interrupt Coalescing Effects**: Impact of NIC interrupt batching
+- **NUMA Effects**: Cross-socket memory access penalties
+- **CPU Cache Effects**: Impact of network buffer cache misses
+
+#### Implementation Strategy
+
+##### Phase 1: Enhanced Application-Level Timing
+
+```cpp
+// Modify sink_buffer.cpp to add serialization timing
+void SinkBuffer::_send_rpc(DisposableClosure<PTransmitChunkResult, ClosureContext>* closure,
+                          const TransmitChunkInfo& request) {
+    auto& timing = closure->context.detailed_timing;
+    timing.send_timestamp = MonotonicNanos();
+    
+    // ... existing serialization code ...
+    timing.serialization_complete = MonotonicNanos();
+    
+    // Hook BRPC callbacks for kernel timing
+    closure->cntl.set_timeout_ms(timeout_ms);
+    closure->cntl.OnSendComplete([&timing]() {
+        timing.kernel_send_timestamp = MonotonicNanos();
+    });
+}
+```
+
+##### Phase 2: eBPF Integration
+
+```cpp
+// Integration layer for eBPF events
+class eBPFNetworkProfiler {
+    void StartMonitoring(int be_pid) {
+        // Load eBPF program targeting StarRocks BE process
+        // Correlate eBPF events with application timestamps
+    }
+    
+    NetworkStackTiming GetDetailedTiming(const ConnectionInfo& conn) {
+        // Retrieve kernel-level timing data for specific connection
+    }
+};
+```
+
+##### Phase 3: Comprehensive Metrics Dashboard
+
+**New Metrics Available:**
+
+- `NetworkTime.Serialization`: Pure serialization overhead
+- `NetworkTime.KernelSend`: Kernel send path processing
+- `NetworkTime.WireTime`: Actual network transmission
+- `NetworkTime.KernelRecv`: Kernel receive path processing  
+- `NetworkTime.BRPCOverhead`: Framework processing overhead
+- `NetworkTime.TCPRetransmissions`: Network reliability impact
+- `NetworkTime.CongestionControl`: TCP flow control effects
+
+#### Performance Analysis Benefits
+
+This enhanced measurement framework enables:
+
+1. **Precise Bottleneck Identification**
+   - Distinguish between network congestion vs. serialization overhead
+   - Identify kernel-level vs. application-level performance issues
+   - Detect NUMA and CPU scheduling effects on network performance
+
+2. **Network Infrastructure Optimization**
+   - Tune TCP parameters based on actual congestion control behavior
+   - Optimize NIC interrupt coalescing for StarRocks workloads
+   - Identify optimal BRPC connection pool sizing
+
+3. **Query Performance Correlation**
+   - Correlate network performance with query complexity
+   - Identify data size thresholds where network becomes the bottleneck
+   - Optimize data partitioning strategies based on network characteristics
+
+4. **Proactive Monitoring**
+   - Detect network degradation before it impacts query performance  
+   - Monitor network stack health across the cluster
+   - Alert on abnormal retransmission or congestion patterns
+
+#### Implementation Considerations
+
+**Performance Impact**: eBPF and detailed timing add measurement overhead (~1-5% CPU increase)
+
+**Complexity**: Requires kernel-level programming expertise and careful correlation between user-space and kernel events
+
+**Portability**: eBPF programs may need adaptation for different kernel versions and network drivers
+
+**Storage**: Detailed timing data significantly increases profiling data volume
+
+This enhanced framework transforms NetworkTime from a single aggregated metric into a comprehensive network performance analysis toolkit, enabling precise optimization of StarRocks' distributed query execution performance.
