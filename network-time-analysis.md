@@ -18,7 +18,7 @@ Where:
 
 - `send_timestamp`: Captured when the RPC closure is created (before serialization)
 - `response_received_timestamp`: Captured when the RPC response is received
-- `receiver_post_process_time`: Time spent on the receiver side processing the request
+- `receiver_post_process_time`: Time spent on the receiver side processing the request (measured by the receiver and sent back in the RPC response)
 
 ### Key Components Included in NetworkTime
 
@@ -46,22 +46,25 @@ Where:
 The timing measurement begins when the RPC closure is created:
 
 ```cpp
-// Line 349-350: Timestamp captured BEFORE serialization
+// File: be/src/exec/pipeline/exchange/sink_buffer.cpp, Line 349-350
+// Timestamp captured BEFORE serialization
 auto* closure = new DisposableClosure<PTransmitChunkResult, ClosureContext>(
-    {instance_id, request.params->sequence(), MonotonicNanos()});
+        {instance_id, request.params->sequence(), MonotonicNanos()});
 ```
 
 Serialization occurs afterward in `_send_rpc()`:
 
 ```cpp
-// Lines 434-435: Serialization happens AFTER timestamp capture
+// File: be/src/exec/pipeline/exchange/sink_buffer.cpp, Line 434
+// Serialization happens AFTER timestamp capture
 request.params->SerializeToZeroCopyStream(&wrapper);
 ```
 
 The NetworkTime is calculated when the response is received:
 
 ```cpp
-// Lines 232-234: NetworkTime calculation
+// File: be/src/exec/pipeline/exchange/sink_buffer.cpp, Line 233
+// NetworkTime calculation in _update_network_time()
 int64_t time_usage = get_response_timestamp - send_timestamp - receiver_post_process_time;
 context.network_time.update(time_usage, concurrency);
 ```
@@ -73,7 +76,8 @@ context.network_time.update(time_usage, concurrency);
 The receiver measures its own processing time:
 
 ```cpp
-// Lines 100-105: Receiver timing
+// File: be/src/service/internal_service.cpp, Lines 97-106
+// Receiver timing in WrapClosure class
 class WrapClosure : public google::protobuf::Closure {
     // ...
     void Run() override {
@@ -85,17 +89,65 @@ private:
 };
 ```
 
+### Receiver-side Processing Time Synchronization
+
+**Critical Understanding**: The `receiver_post_process_time` is **measured on the receiver side** and **sent back to the sender** via the RPC response. This enables accurate NetworkTime calculation despite the distributed nature of the measurement.
+
+#### How Synchronization Works
+
+1. **Receiver Measures Its Own Processing Time**:
+
+   ```cpp
+   // File: be/src/service/internal_service.cpp, Lines 114 & 105
+   // When RPC request arrives, capture receive timestamp
+   const int64_t _receive_timestamp = MonotonicNanos(); // Set on closure construction
+   
+   // When processing is complete, capture response timestamp  
+   const auto response_timestamp = MonotonicNanos();
+   
+   // Calculate and embed processing time in the response protobuf
+   _response->set_receiver_post_process_time(response_timestamp - _receive_timestamp);
+   ```
+
+2. **Sender Extracts Processing Time from Response**:
+
+   ```cpp
+   // File: be/src/exec/pipeline/exchange/sink_buffer.cpp, Line 395
+   closure->addSuccessHandler([this](const ClosureContext& ctx, const PTransmitChunkResult& result) {
+       // Extract receiver's processing time from the RPC response
+       _update_network_time(ctx.instance_id, ctx.send_timestamp, result.receiver_post_process_time());
+   });
+   ```
+
+3. **Pure Network Time Calculation**:
+
+   ```cpp
+   // File: be/src/exec/pipeline/exchange/sink_buffer.cpp, Line 233
+   // Subtract receiver processing time to get pure network + serialization time
+   int64_t time_usage = get_response_timestamp - send_timestamp - receiver_post_process_time;
+   ```
+
+This design ensures that:
+
+- **Receiver-side deserialization and processing** is excluded from NetworkTime
+- **Network latency and sender-side serialization** is accurately captured
+- **No separate communication channel** is needed (timing data piggybacks on the RPC response)
+- **Clock synchronization between nodes** is not required (each node uses its own monotonic clock)
+
 ### Concurrency Handling
 
 NetworkTime accounts for concurrent RPCs to provide accurate measurements:
 
 ```cpp
+// File: be/src/exec/pipeline/exchange/sink_buffer.cpp, Lines 201-204
 // Average concurrency calculation to adjust for parallel transmissions
-double average_concurrency = static_cast<double>(time_trace.accumulated_concurrency) / std::max(1, time_trace.times);
-int64_t average_accumulated_time = static_cast<int64_t>(time_trace.accumulated_time / std::max(1.0, average_concurrency));
+double average_concurrency =
+        static_cast<double>(time_trace.accumulated_concurrency) / std::max(1, time_trace.times);
+int64_t average_accumulated_time =
+        static_cast<int64_t>(time_trace.accumulated_time / std::max(1.0, average_concurrency));
 ```
 
-The final NetworkTime reported is the **maximum** average accumulated time among all destinations.
+The final NetworkTime reported is the **maximum** average accumulated time among all destinations (Line 206-208 in the same function).
 
 ### Usage Context
 
