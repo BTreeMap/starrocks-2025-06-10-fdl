@@ -1,6 +1,0 @@
-position: 50 # float position is supported
-label: 'Catalog'
-collapsible: true
-collapsed: true
-link:
-  type: generated-index

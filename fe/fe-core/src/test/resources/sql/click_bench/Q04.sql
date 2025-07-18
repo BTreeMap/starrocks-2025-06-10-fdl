@@ -1,2 +1,0 @@
--- Q04
-SELECT AVG(UserID) FROM hits;

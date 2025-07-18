@@ -1,6 +1,0 @@
-position: 110 # float position is supported
-label: 'Function'
-collapsible: true
-collapsed: true
-link:
-  type: generated-index
