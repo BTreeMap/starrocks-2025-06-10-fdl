@@ -22,8 +22,7 @@ jobs:
           docker run -v $(pwd)/starrocks-3.5.1:/root/starrocks \
             -v ~/.m2:/root/.m2 \
             --name starrocks-build \
-            -d starrocks/dev-env-ubuntu:latest
-          docker exec starrocks-build /bin/bash -c "cd /root/starrocks && ./build.sh"
+            starrocks/dev-env-ubuntu:latest /bin/bash -c "cd /root/starrocks && ./build.sh"
 
       - name: Archive build artifacts (optional)
         uses: actions/upload-artifact@v4
