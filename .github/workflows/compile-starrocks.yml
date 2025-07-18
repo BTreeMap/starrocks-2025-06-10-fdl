@@ -1,0 +1,32 @@
+name: Compile StarRocks
+
+on:
+  push:
+    branches: [ fdl-perf ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
+
+      - name: Pull StarRocks dev-env image
+        run: docker pull starrocks/dev-env-ubuntu:latest  # Replace with your branch's image, e.g., starrocks/dev-env-ubuntu:3.2-latest
+
+      - name: Compile StarRocks in Docker
+        run: |
+          docker run -v $(pwd)/starrocks-3.5.1:/root/starrocks \
+            -v ~/.m2:/root/.m2 \  # Optional: Mount Maven cache to speed up builds
+            --name starrocks-build \
+            -d starrocks/dev-env-ubuntu:latest
+          docker exec -it starrocks-build /bin/bash -c "cd /root/starrocks && ./build.sh"
+
+      - name: Archive build artifacts (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: starrocks-build-output
+          path: /root/starrocks/output  # Adjust based on actual output path
