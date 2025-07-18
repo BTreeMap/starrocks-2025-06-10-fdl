@@ -45,7 +45,7 @@ jobs:
             -e CCACHE_BASEDIR=${{ env.CCACHE_BASEDIR }} \
             --name starrocks-build \
             starrocks/dev-env-ubuntu:latest \
-            /bin/bash -c "cd /root/starrocks && ./build.sh -j $(nproc) && ccache -s"
+            /bin/bash -c "cd /root/starrocks && BUILD_TYPE=Debug ./build.sh -j $(nproc) && ccache -s"
 
       - name: Archive build artifacts (optional)
         uses: actions/upload-artifact@v4
