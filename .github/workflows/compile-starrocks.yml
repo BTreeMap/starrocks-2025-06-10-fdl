@@ -39,7 +39,6 @@ jobs:
       - name: Compile StarRocks in Docker
         run: |
           docker run \
-            -v $(pwd)/starrocks-3.5.1:/root/starrocks \
             -v ${{ github.workspace }}/starrocks-3.5.1:/root/starrocks \
             -v ${{ env.CCACHE_DIR }}:/root/.ccache \
             -v ~/.m2:/root/.m2 \
@@ -55,4 +54,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: starrocks-build-output
-          path: /root/starrocks/output
+          path: ${{ github.workspace }}/starrocks-3.5.1/output
