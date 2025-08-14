@@ -164,6 +164,15 @@ void SinkBuffer::update_profile(RuntimeProfile* profile) {
     COUNTER_SET(network_timer, _network_time());
     COUNTER_SET(overall_timer, _last_receive_time - _first_send_time);
 
+    // Add detailed timing breakdown
+    auto [serialization_time, pure_network_time] = _detailed_timing();
+    if (serialization_time > 0 || pure_network_time > 0) {
+        auto* serialization_timer = ADD_TIMER(profile, "SerializationTime");
+        auto* pure_network_timer = ADD_TIMER(profile, "PureNetworkTime");
+        COUNTER_SET(serialization_timer, serialization_time);
+        COUNTER_SET(pure_network_timer, pure_network_time);
+    }
+
     // WaitTime consists two parts
     // 1. buffer full time
     // 2. pending finish time
@@ -209,6 +218,31 @@ int64_t SinkBuffer::_network_time() {
     return max;
 }
 
+std::pair<int64_t, int64_t> SinkBuffer::_detailed_timing() {
+    int64_t max_serialization_time = 0;
+    int64_t max_network_time = 0;
+    
+    for (auto& [_, context] : _sink_ctxs) {
+        auto& detailed_trace = context->detailed_time;
+        if (detailed_trace.times > 0) {
+            double average_concurrency =
+                    static_cast<double>(detailed_trace.accumulated_concurrency) / std::max(1, detailed_trace.times);
+            int64_t average_serialization_time =
+                    static_cast<int64_t>(detailed_trace.accumulated_serialization_time / std::max(1.0, average_concurrency));
+            int64_t average_network_time =
+                    static_cast<int64_t>(detailed_trace.accumulated_network_time / std::max(1.0, average_concurrency));
+            
+            if (average_serialization_time > max_serialization_time) {
+                max_serialization_time = average_serialization_time;
+            }
+            if (average_network_time > max_network_time) {
+                max_network_time = average_network_time;
+            }
+        }
+    }
+    return {max_serialization_time, max_network_time};
+}
+
 void SinkBuffer::cancel_one_sinker(RuntimeState* const state) {
     auto notify = this->defer_notify();
     if (--_num_uncancelled_sinkers == 0) {
@@ -233,6 +267,27 @@ void SinkBuffer::_update_network_time(const TUniqueId& instance_id, const int64_
     int64_t time_usage = get_response_timestamp - send_timestamp - receiver_post_process_time;
     context.network_time.update(time_usage, concurrency);
     _rpc_cumulative_time += time_usage;
+    _rpc_count++;
+}
+
+void SinkBuffer::_update_detailed_time(const TUniqueId& instance_id, const int64_t send_timestamp,
+                                      const int64_t serialization_complete_timestamp,
+                                      const int64_t receiver_post_process_time) {
+    auto& context = sink_ctx(instance_id.lo);
+    const int64_t get_response_timestamp = MonotonicNanos();
+    _last_receive_time = get_response_timestamp;
+    int32_t concurrency = context.num_in_flight_rpcs;
+    
+    // Calculate decomposed times
+    int64_t serialization_time = serialization_complete_timestamp - send_timestamp;
+    int64_t network_time = get_response_timestamp - serialization_complete_timestamp - receiver_post_process_time;
+    
+    // Update both legacy and detailed metrics
+    int64_t total_time = get_response_timestamp - send_timestamp - receiver_post_process_time;
+    context.network_time.update(total_time, concurrency);
+    context.detailed_time.update(serialization_time, network_time, concurrency);
+    
+    _rpc_cumulative_time += total_time;
     _rpc_count++;
 }
 
@@ -347,7 +402,7 @@ Status SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, const std::fun
         }
 
         auto* closure = new DisposableClosure<PTransmitChunkResult, ClosureContext>(
-                {instance_id, request.params->sequence(), MonotonicNanos()});
+                {instance_id, request.params->sequence(), MonotonicNanos(), 0});
         if (_first_send_time == -1) {
             _first_send_time = MonotonicNanos();
         }
@@ -392,7 +447,13 @@ Status SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, const std::fun
                                             status.message());
             } else {
                 static_cast<void>(_try_to_send_rpc(ctx.instance_id, [&]() {
-                    _update_network_time(ctx.instance_id, ctx.send_timestamp, result.receiver_post_process_time());
+                    if (ctx.serialization_complete_timestamp > 0) {
+                        _update_detailed_time(ctx.instance_id, ctx.send_timestamp, 
+                                            ctx.serialization_complete_timestamp, 
+                                            result.receiver_post_process_time());
+                    } else {
+                        _update_network_time(ctx.instance_id, ctx.send_timestamp, result.receiver_post_process_time());
+                    }
                     _process_send_window(ctx.instance_id, ctx.sequence);
                 }));
             }
@@ -432,6 +493,9 @@ Status SinkBuffer::_send_rpc(DisposableClosure<PTransmitChunkResult, ClosureCont
         butil::IOBuf iobuf;
         butil::IOBufAsZeroCopyOutputStream wrapper(&iobuf);
         request.params->SerializeToZeroCopyStream(&wrapper);
+        // Capture serialization complete timestamp
+        closure->ctx.serialization_complete_timestamp = MonotonicNanos();
+        
         // append params to iobuf
         size_t params_size = iobuf.size();
         closure->cntl.request_attachment().append(&params_size, sizeof(params_size));
@@ -455,6 +519,8 @@ Status SinkBuffer::_send_rpc(DisposableClosure<PTransmitChunkResult, ClosureCont
         }
         res.value()->transmit_chunk_via_http(&closure->cntl, nullptr, &closure->result, closure);
     } else {
+        // For non-HTTP RPC, serialization happens inside BRPC, capture timestamp before
+        closure->ctx.serialization_complete_timestamp = MonotonicNanos();
         closure->cntl.request_attachment().append(request.attachment);
         request.brpc_stub->transmit_chunk(&closure->cntl, request.params.get(), &closure->result, closure);
     }

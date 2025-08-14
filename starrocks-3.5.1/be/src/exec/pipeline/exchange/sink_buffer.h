@@ -45,6 +45,7 @@ struct ClosureContext {
     TUniqueId instance_id;
     int64_t sequence;
     int64_t send_timestamp;
+    int64_t serialization_complete_timestamp;
 };
 
 struct TransmitChunkInfo {
@@ -75,6 +76,21 @@ struct TimeTrace {
     void update(int64_t time, int32_t concurrency) {
         times++;
         accumulated_time += time;
+        accumulated_concurrency += concurrency;
+    }
+};
+
+// Enhanced time decomposition for single-way analysis
+struct DetailedTimeTrace {
+    int32_t times = 0;
+    int64_t accumulated_serialization_time = 0;
+    int64_t accumulated_network_time = 0;
+    int32_t accumulated_concurrency = 0;
+
+    void update(int64_t serialization_time, int64_t network_time, int32_t concurrency) {
+        times++;
+        accumulated_serialization_time += serialization_time;
+        accumulated_network_time += network_time;
         accumulated_concurrency += concurrency;
     }
 };
@@ -116,6 +132,9 @@ private:
 
     void _update_network_time(const TUniqueId& instance_id, const int64_t send_timestamp,
                               const int64_t receiver_post_process_time);
+    void _update_detailed_time(const TUniqueId& instance_id, const int64_t send_timestamp,
+                              const int64_t serialization_complete_timestamp, 
+                              const int64_t receiver_post_process_time);
     // Update the discontinuous acked window, here are the invariants:
     // all acks received with sequence from [0, _max_continuous_acked_seqs[x]]
     // not all the acks received with sequence from [_max_continuous_acked_seqs[x]+1, _request_seqs[x]]
@@ -136,6 +155,9 @@ private:
     // `accumulated_network_time / average_concurrency`
     // And we just pick the maximum accumulated_network_time among all destination
     int64_t _network_time();
+
+    // Get detailed timing breakdown for enhanced network analysis
+    std::pair<int64_t, int64_t> _detailed_timing(); // Returns {serialization_time, pure_network_time}
 
     FragmentContext* _fragment_ctx;
     MemTracker* const _mem_tracker;
@@ -167,6 +189,7 @@ private:
         std::atomic_size_t num_finished_rpcs;
         std::atomic_size_t num_in_flight_rpcs;
         TimeTrace network_time;
+        DetailedTimeTrace detailed_time;
 
         Mutex mutex;
 
