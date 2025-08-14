@@ -30,6 +30,13 @@ jobs:
             ccache-${{ runner.os }}-${{ github.ref_name }}-
             ccache-${{ runner.os }}-
 
+      - name: Check ccache restore status
+        run: |
+          echo "=== CCACHE DIRECTORY STATUS ==="
+          ls -la ${{ env.CCACHE_DIR }} || echo "ccache directory does not exist"
+          echo "=== CCACHE DIRECTORY SIZE ==="
+          du -sh ${{ env.CCACHE_DIR }} 2>/dev/null || echo "Cannot calculate ccache directory size"
+
       - name: Set up Docker
         uses: docker/setup-buildx-action@v3
 
@@ -48,10 +55,26 @@ jobs:
             -e CCACHE_BASEDIR=${{ env.CCACHE_BASEDIR }} \
             --name starrocks-build \
             starrocks/dev-env-ubuntu:latest \
-            /bin/bash -c "cd /root/starrocks && BUILD_TYPE=Debug ./build.sh -j $(nproc) && ccache -s"
+            /bin/bash -c "
+              cd /root/starrocks && 
+              echo '=== CCACHE STATS BEFORE BUILD ===' && 
+              ccache -s && 
+              echo '=== STARTING BUILD ===' && 
+              BUILD_TYPE=Debug ./build.sh -j $(nproc) && 
+              echo '=== CCACHE STATS AFTER BUILD ===' && 
+              ccache -s
+            "
 
       - name: Archive build artifacts (optional)
         uses: actions/upload-artifact@v4
         with:
           name: starrocks-build-output
           path: ${{ github.workspace }}/starrocks-3.5.1/output
+
+      - name: Final ccache status for cache upload
+        run: |
+          echo "=== FINAL CCACHE STATUS ==="
+          echo "Cache will be uploaded automatically if job succeeds"
+          echo "Cache key: ccache-${{ runner.os }}-${{ github.ref_name }}-${{ hashFiles('**/build.sh', '**/CMakeLists.txt') }}"
+          echo "Cache directory size:"
+          du -sh ${{ env.CCACHE_DIR }} 2>/dev/null || echo "Cannot calculate ccache directory size"
