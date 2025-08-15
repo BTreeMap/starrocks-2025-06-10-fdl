@@ -165,7 +165,7 @@ private:
     // `accumulated_network_time / average_concurrency`
     // And we just pick the maximum accumulated_network_time among all destination
     int64_t _network_time();
-    
+
     // Helper methods for detailed timing metrics
     int64_t _detailed_serialization_time();
     int64_t _detailed_network_time();

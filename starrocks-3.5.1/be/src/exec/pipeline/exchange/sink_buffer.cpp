@@ -162,13 +162,13 @@ void SinkBuffer::update_profile(RuntimeProfile* profile) {
     COUNTER_SET(rpc_avg_timer, _rpc_cumulative_time / std::max(_rpc_count.load(), static_cast<int64_t>(1)));
 
     COUNTER_SET(network_timer, _network_time());
-    
+
     // Add detailed timing metrics for single-way time decomposition
     auto* serialization_timer = ADD_TIMER(profile, "SerializationTime");
     auto* pure_network_timer = ADD_TIMER(profile, "PureNetworkTime");
     COUNTER_SET(serialization_timer, _detailed_serialization_time());
     COUNTER_SET(pure_network_timer, _detailed_network_time());
-    
+
     COUNTER_SET(overall_timer, _last_receive_time - _first_send_time);
 
     // WaitTime consists two parts
@@ -222,8 +222,8 @@ int64_t SinkBuffer::_detailed_serialization_time() {
         auto& detailed_trace = context->detailed_time;
         double average_concurrency =
                 static_cast<double>(detailed_trace.accumulated_concurrency) / std::max(1, detailed_trace.times);
-        int64_t average_accumulated_time =
-                static_cast<int64_t>(detailed_trace.accumulated_serialization_time / std::max(1.0, average_concurrency));
+        int64_t average_accumulated_time = static_cast<int64_t>(detailed_trace.accumulated_serialization_time /
+                                                                std::max(1.0, average_concurrency));
         if (average_accumulated_time > max) {
             max = average_accumulated_time;
         }
