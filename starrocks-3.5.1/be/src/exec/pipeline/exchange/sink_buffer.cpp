@@ -387,7 +387,8 @@ Status SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, const std::fun
             _fragment_ctx->cancel(Status::ThriftRpcError(err_msg));
             LOG(WARNING) << err_msg;
         });
-        closure->addSuccessHandler([this](const ClosureContext& ctx, const PTransmitChunkResult& result) noexcept {
+        closure->addSuccessHandler([this, closure](const ClosureContext& ctx,
+                                                   const PTransmitChunkResult& result) noexcept {
             auto query_ctx = _fragment_ctx->runtime_state()->query_ctx();
             auto query_ctx_guard = query_ctx->shared_from_this();
             auto notify = this->defer_notify();
@@ -408,7 +409,7 @@ Status SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, const std::fun
                                             status.message());
             } else {
                 static_cast<void>(_try_to_send_rpc(ctx.instance_id, [&]() {
-                    _update_detailed_time(ctx.instance_id, ctx.send_timestamp, this->serialization_timestamp.load(),
+                    _update_detailed_time(ctx.instance_id, ctx.send_timestamp, closure->serialization_timestamp.load(),
                                           result.receiver_post_process_time());
                     _update_network_time(ctx.instance_id, ctx.send_timestamp, result.receiver_post_process_time());
                     _process_send_window(ctx.instance_id, ctx.sequence);
