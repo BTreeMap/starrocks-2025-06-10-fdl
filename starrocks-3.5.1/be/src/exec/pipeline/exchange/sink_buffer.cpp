@@ -221,17 +221,17 @@ int64_t SinkBuffer::_network_time() {
 std::pair<int64_t, int64_t> SinkBuffer::_detailed_timing() {
     int64_t max_serialization_time = 0;
     int64_t max_network_time = 0;
-
+    
     for (auto& [_, context] : _sink_ctxs) {
         auto& detailed_trace = context->detailed_time;
         if (detailed_trace.times > 0) {
             double average_concurrency =
                     static_cast<double>(detailed_trace.accumulated_concurrency) / std::max(1, detailed_trace.times);
-            int64_t average_serialization_time = static_cast<int64_t>(detailed_trace.accumulated_serialization_time /
-                                                                      std::max(1.0, average_concurrency));
+            int64_t average_serialization_time =
+                    static_cast<int64_t>(detailed_trace.accumulated_serialization_time / std::max(1.0, average_concurrency));
             int64_t average_network_time =
                     static_cast<int64_t>(detailed_trace.accumulated_network_time / std::max(1.0, average_concurrency));
-
+            
             if (average_serialization_time > max_serialization_time) {
                 max_serialization_time = average_serialization_time;
             }
@@ -271,22 +271,22 @@ void SinkBuffer::_update_network_time(const TUniqueId& instance_id, const int64_
 }
 
 void SinkBuffer::_update_detailed_time(const TUniqueId& instance_id, const int64_t send_timestamp,
-                                       const int64_t serialization_complete_timestamp,
-                                       const int64_t receiver_post_process_time) {
+                                      const int64_t serialization_complete_timestamp,
+                                      const int64_t receiver_post_process_time) {
     auto& context = sink_ctx(instance_id.lo);
     const int64_t get_response_timestamp = MonotonicNanos();
     _last_receive_time = get_response_timestamp;
     int32_t concurrency = context.num_in_flight_rpcs;
-
+    
     // Calculate decomposed times
     int64_t serialization_time = serialization_complete_timestamp - send_timestamp;
     int64_t network_time = get_response_timestamp - serialization_complete_timestamp - receiver_post_process_time;
-
+    
     // Update both legacy and detailed metrics
     int64_t total_time = get_response_timestamp - send_timestamp - receiver_post_process_time;
     context.network_time.update(total_time, concurrency);
     context.detailed_time.update(serialization_time, network_time, concurrency);
-
+    
     _rpc_cumulative_time += total_time;
     _rpc_count++;
 }
@@ -429,63 +429,61 @@ Status SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, const std::fun
             auto query_ctx = _fragment_ctx->runtime_state()->query_ctx();
             auto query_ctx_guard = query_ctx->shared_from_this();
             auto notify = this->defer_notify();
-            closure->addSuccessHandler([this, closure](const ClosureContext& ctx,
-                                                       const PTransmitChunkResult& result) noexcept {
-                auto query_ctx = _fragment_ctx->runtime_state()->query_ctx();
-                auto query_ctx_guard = query_ctx->shared_from_this();
-                auto notify = this->defer_notify();
+        closure->addSuccessHandler([this, closure](const ClosureContext& ctx, const PTransmitChunkResult& result) noexcept {
+            auto query_ctx = _fragment_ctx->runtime_state()->query_ctx();
+            auto query_ctx_guard = query_ctx->shared_from_this();
+            auto notify = this->defer_notify();
 
-                auto defer = DeferOp([this]() { --_total_in_flight_rpc; });
-                Status status(result.status());
-                auto& context = sink_ctx(ctx.instance_id.lo);
-                ++context.num_finished_rpcs;
-                --context.num_in_flight_rpcs;
+            auto defer = DeferOp([this]() { --_total_in_flight_rpc; });
+            Status status(result.status());
+            auto& context = sink_ctx(ctx.instance_id.lo);
+            ++context.num_finished_rpcs;
+            --context.num_in_flight_rpcs;
 
-                if (!status.ok()) {
-                    _is_finishing = true;
-                    _fragment_ctx->cancel(status);
+            if (!status.ok()) {
+                _is_finishing = true;
+                _fragment_ctx->cancel(status);
 
-                    const auto& dest_addr = context.dest_addrs;
-                    LOG(WARNING) << fmt::format("transmit chunk rpc failed [dest_instance_id={}] [dest={}:{}] [msg={}]",
-                                                print_id(ctx.instance_id), dest_addr.hostname, dest_addr.port,
-                                                status.message());
-                } else {
-                    // Access serialization timestamp from the closure
-                    int64_t serialization_timestamp = closure->serialization_complete_timestamp.load();
-
-                    static_cast<void>(_try_to_send_rpc(ctx.instance_id, [&]() {
-                        if (serialization_timestamp > 0) {
-                            _update_detailed_time(ctx.instance_id, ctx.send_timestamp, serialization_timestamp,
-                                                  result.receiver_post_process_time());
-                        } else {
-                            _update_network_time(ctx.instance_id, ctx.send_timestamp,
-                                                 result.receiver_post_process_time());
-                        }
-                        _process_send_window(ctx.instance_id, ctx.sequence);
-                    }));
-                }
-            });
-            // Attachment will be released by process_mem_tracker in closure->Run() in bthread, when receiving the response,
-            // so decrease the memory usage of attachment from instance_mem_tracker immediately before sending the request.
-            _mem_tracker->release(request.attachment_physical_bytes);
-            GlobalEnv::GetInstance()->process_mem_tracker()->consume(request.attachment_physical_bytes);
-
-            closure->cntl.Reset();
-            closure->cntl.set_timeout_ms(_brpc_timeout_ms);
-            SET_IGNORE_OVERCROWDED(closure->cntl, query);
-
-            Status st;
-            if (bthread_self()) {
-                st = _send_rpc(closure, request);
+                const auto& dest_addr = context.dest_addrs;
+                LOG(WARNING) << fmt::format("transmit chunk rpc failed [dest_instance_id={}] [dest={}:{}] [msg={}]",
+                                            print_id(ctx.instance_id), dest_addr.hostname, dest_addr.port,
+                                            status.message());
             } else {
-                // When the driver worker thread sends request and creates the protobuf request,
-                // also use process_mem_tracker to record the memory of the protobuf request.
-                SCOPED_THREAD_LOCAL_MEM_TRACKER_SETTER(nullptr);
-                // must in the same scope following the above
-                st = _send_rpc(closure, request);
+                // Access serialization timestamp from the closure
+                int64_t serialization_timestamp = closure->serialization_complete_timestamp.load();
+                
+                static_cast<void>(_try_to_send_rpc(ctx.instance_id, [&]() {
+                    if (serialization_timestamp > 0) {
+                        _update_detailed_time(ctx.instance_id, ctx.send_timestamp, 
+                                            serialization_timestamp, 
+                                            result.receiver_post_process_time());
+                    } else {
+                        _update_network_time(ctx.instance_id, ctx.send_timestamp, result.receiver_post_process_time());
+                    }
+                    _process_send_window(ctx.instance_id, ctx.sequence);
+                }));
             }
-            return st;
+        });
+        // Attachment will be released by process_mem_tracker in closure->Run() in bthread, when receiving the response,
+        // so decrease the memory usage of attachment from instance_mem_tracker immediately before sending the request.
+        _mem_tracker->release(request.attachment_physical_bytes);
+        GlobalEnv::GetInstance()->process_mem_tracker()->consume(request.attachment_physical_bytes);
+
+        closure->cntl.Reset();
+        closure->cntl.set_timeout_ms(_brpc_timeout_ms);
+        SET_IGNORE_OVERCROWDED(closure->cntl, query);
+
+        Status st;
+        if (bthread_self()) {
+            st = _send_rpc(closure, request);
+        } else {
+            // When the driver worker thread sends request and creates the protobuf request,
+            // also use process_mem_tracker to record the memory of the protobuf request.
+            SCOPED_THREAD_LOCAL_MEM_TRACKER_SETTER(nullptr);
+            // must in the same scope following the above
+            st = _send_rpc(closure, request);
         }
+        return st;
     }
     return Status::OK();
 }
@@ -496,10 +494,10 @@ Status SinkBuffer::_send_rpc(TimedDisposableClosure* closure, const TransmitChun
         butil::IOBuf iobuf;
         butil::IOBufAsZeroCopyOutputStream wrapper(&iobuf);
         request.params->SerializeToZeroCopyStream(&wrapper);
-
+        
         // Capture serialization complete timestamp in the closure
         closure->serialization_complete_timestamp.store(MonotonicNanos());
-
+        
         // append params to iobuf
         size_t params_size = iobuf.size();
         closure->cntl.request_attachment().append(&params_size, sizeof(params_size));
