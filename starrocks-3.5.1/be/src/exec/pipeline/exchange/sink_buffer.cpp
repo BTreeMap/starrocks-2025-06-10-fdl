@@ -162,6 +162,13 @@ void SinkBuffer::update_profile(RuntimeProfile* profile) {
     COUNTER_SET(rpc_avg_timer, _rpc_cumulative_time / std::max(_rpc_count.load(), static_cast<int64_t>(1)));
 
     COUNTER_SET(network_timer, _network_time());
+    
+    // Add detailed timing metrics for single-way time decomposition
+    auto* serialization_timer = ADD_TIMER(profile, "SerializationTime");
+    auto* pure_network_timer = ADD_TIMER(profile, "PureNetworkTime");
+    COUNTER_SET(serialization_timer, _detailed_serialization_time());
+    COUNTER_SET(pure_network_timer, _detailed_network_time());
+    
     COUNTER_SET(overall_timer, _last_receive_time - _first_send_time);
 
     // WaitTime consists two parts
@@ -209,6 +216,36 @@ int64_t SinkBuffer::_network_time() {
     return max;
 }
 
+int64_t SinkBuffer::_detailed_serialization_time() {
+    int64_t max = 0;
+    for (auto& [_, context] : _sink_ctxs) {
+        auto& detailed_trace = context->detailed_time;
+        double average_concurrency =
+                static_cast<double>(detailed_trace.accumulated_concurrency) / std::max(1, detailed_trace.times);
+        int64_t average_accumulated_time =
+                static_cast<int64_t>(detailed_trace.accumulated_serialization_time / std::max(1.0, average_concurrency));
+        if (average_accumulated_time > max) {
+            max = average_accumulated_time;
+        }
+    }
+    return max;
+}
+
+int64_t SinkBuffer::_detailed_network_time() {
+    int64_t max = 0;
+    for (auto& [_, context] : _sink_ctxs) {
+        auto& detailed_trace = context->detailed_time;
+        double average_concurrency =
+                static_cast<double>(detailed_trace.accumulated_concurrency) / std::max(1, detailed_trace.times);
+        int64_t average_accumulated_time =
+                static_cast<int64_t>(detailed_trace.accumulated_network_time / std::max(1.0, average_concurrency));
+        if (average_accumulated_time > max) {
+            max = average_accumulated_time;
+        }
+    }
+    return max;
+}
+
 void SinkBuffer::cancel_one_sinker(RuntimeState* const state) {
     auto notify = this->defer_notify();
     if (--_num_uncancelled_sinkers == 0) {
@@ -247,9 +284,10 @@ void SinkBuffer::_update_detailed_time(const TUniqueId& instance_id, const int64
     int64_t total_round_trip = MonotonicNanos() - send_timestamp - receiver_post_process_time;
     int64_t pure_network_time = total_round_trip - serialization_time;
 
-    // Log detailed timing for profiling (this would normally go to query profile)
-    VLOG(3) << "Detailed timing [instance=" << print_id(instance_id) << "] SerializationTime=" << serialization_time
-            << "ns, PureNetworkTime=" << pure_network_time << "ns, TotalRoundTrip=" << total_round_trip << "ns";
+    // Update detailed timing metrics with concurrency level
+    auto* sink_context = &sink_ctx(instance_id.lo);
+    int32_t concurrency = sink_context->num_in_flight_rpcs.load();
+    sink_context->detailed_time.update(serialization_time, pure_network_time, concurrency);
 }
 
 void SinkBuffer::_process_send_window(const TUniqueId& instance_id, const int64_t sequence) {

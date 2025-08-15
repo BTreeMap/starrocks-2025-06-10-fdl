@@ -88,6 +88,21 @@ struct TimeTrace {
     }
 };
 
+// Enhanced time decomposition for single-way analysis
+struct DetailedTimeTrace {
+    int32_t times = 0;
+    int64_t accumulated_serialization_time = 0;
+    int64_t accumulated_network_time = 0;
+    int32_t accumulated_concurrency = 0;
+
+    void update(int64_t serialization_time, int64_t network_time, int32_t concurrency) {
+        times++;
+        accumulated_serialization_time += serialization_time;
+        accumulated_network_time += network_time;
+        accumulated_concurrency += concurrency;
+    }
+};
+
 class SinkBuffer {
 public:
     SinkBuffer(FragmentContext* fragment_ctx, const std::vector<TPlanFragmentDestination>& destinations,
@@ -150,6 +165,10 @@ private:
     // `accumulated_network_time / average_concurrency`
     // And we just pick the maximum accumulated_network_time among all destination
     int64_t _network_time();
+    
+    // Helper methods for detailed timing metrics
+    int64_t _detailed_serialization_time();
+    int64_t _detailed_network_time();
 
     FragmentContext* _fragment_ctx;
     MemTracker* const _mem_tracker;
@@ -181,6 +200,7 @@ private:
         std::atomic_size_t num_finished_rpcs;
         std::atomic_size_t num_in_flight_rpcs;
         TimeTrace network_time;
+        DetailedTimeTrace detailed_time;
 
         Mutex mutex;
 
