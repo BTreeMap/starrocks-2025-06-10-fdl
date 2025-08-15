@@ -47,6 +47,15 @@ struct ClosureContext {
     int64_t send_timestamp;
 };
 
+// Custom closure that captures serialization timestamp for detailed network timing
+template <typename ResultType, typename ContextType>
+class TimedDisposableClosure : public DisposableClosure<ResultType, ContextType> {
+public:
+    TimedDisposableClosure(const ContextType& context) : DisposableClosure<ResultType, ContextType>(context) {}
+
+    std::atomic<int64_t> serialization_timestamp{0};
+};
+
 struct TransmitChunkInfo {
     // For BUCKET_SHUFFLE_HASH_PARTITIONED, multiple channels may be related to
     // a same exchange source fragment instance, so we should use fragment_instance_id
@@ -116,6 +125,10 @@ private:
 
     void _update_network_time(const TUniqueId& instance_id, const int64_t send_timestamp,
                               const int64_t receiver_post_process_time);
+
+    void _update_detailed_time(const TUniqueId& instance_id, const int64_t send_timestamp,
+                               const int64_t serialization_timestamp, const int64_t receiver_post_process_time);
+
     // Update the discontinuous acked window, here are the invariants:
     // all acks received with sequence from [0, _max_continuous_acked_seqs[x]]
     // not all the acks received with sequence from [_max_continuous_acked_seqs[x]+1, _request_seqs[x]]
@@ -127,7 +140,8 @@ private:
     Status _try_to_send_rpc(const TUniqueId& instance_id, const std::function<void()>& pre_works);
 
     // send by rpc or http
-    Status _send_rpc(DisposableClosure<PTransmitChunkResult, ClosureContext>* closure, const TransmitChunkInfo& req);
+    Status _send_rpc(TimedDisposableClosure<PTransmitChunkResult, ClosureContext>* closure,
+                     const TransmitChunkInfo& req);
 
     // Roughly estimate network time which is defined as the time between sending a and receiving a packet,
     // and the processing time of both sides are excluded

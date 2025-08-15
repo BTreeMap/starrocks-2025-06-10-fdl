@@ -236,6 +236,22 @@ void SinkBuffer::_update_network_time(const TUniqueId& instance_id, const int64_
     _rpc_count++;
 }
 
+void SinkBuffer::_update_detailed_time(const TUniqueId& instance_id, const int64_t send_timestamp,
+                                       const int64_t serialization_timestamp,
+                                       const int64_t receiver_post_process_time) {
+    // This method implements the "single-way time decomposition" enhancement
+    // to break down NetworkTime into SerializationTime and PureNetworkTime
+
+    // Calculate individual timing components
+    int64_t serialization_time = serialization_timestamp - send_timestamp;
+    int64_t total_round_trip = MonotonicNanos() - send_timestamp - receiver_post_process_time;
+    int64_t pure_network_time = total_round_trip - serialization_time;
+
+    // Log detailed timing for profiling (this would normally go to query profile)
+    VLOG(3) << "Detailed timing [instance=" << print_id(instance_id) << "] SerializationTime=" << serialization_time
+            << "ns, PureNetworkTime=" << pure_network_time << "ns, TotalRoundTrip=" << total_round_trip << "ns";
+}
+
 void SinkBuffer::_process_send_window(const TUniqueId& instance_id, const int64_t sequence) {
     // Both sender side and receiver side can tolerate disorder of tranmission
     // if receiver side is not ExchangeMergeSortSourceOperator
@@ -346,7 +362,7 @@ Status SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, const std::fun
             _request_sent++;
         }
 
-        auto* closure = new DisposableClosure<PTransmitChunkResult, ClosureContext>(
+        auto* closure = new TimedDisposableClosure<PTransmitChunkResult, ClosureContext>(
                 {instance_id, request.params->sequence(), MonotonicNanos()});
         if (_first_send_time == -1) {
             _first_send_time = MonotonicNanos();
@@ -392,6 +408,8 @@ Status SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, const std::fun
                                             status.message());
             } else {
                 static_cast<void>(_try_to_send_rpc(ctx.instance_id, [&]() {
+                    _update_detailed_time(ctx.instance_id, ctx.send_timestamp, this->serialization_timestamp.load(),
+                                          result.receiver_post_process_time());
                     _update_network_time(ctx.instance_id, ctx.send_timestamp, result.receiver_post_process_time());
                     _process_send_window(ctx.instance_id, ctx.sequence);
                 }));
@@ -425,13 +443,15 @@ Status SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, const std::fun
     return Status::OK();
 }
 
-Status SinkBuffer::_send_rpc(DisposableClosure<PTransmitChunkResult, ClosureContext>* closure,
+Status SinkBuffer::_send_rpc(TimedDisposableClosure<PTransmitChunkResult, ClosureContext>* closure,
                              const TransmitChunkInfo& request) {
     auto expected_iobuf_size = request.attachment.size() + request.params->ByteSizeLong() + sizeof(size_t) * 2;
     if (UNLIKELY(expected_iobuf_size > _rpc_http_min_size)) {
         butil::IOBuf iobuf;
         butil::IOBufAsZeroCopyOutputStream wrapper(&iobuf);
         request.params->SerializeToZeroCopyStream(&wrapper);
+        // Capture serialization completion timestamp
+        closure->serialization_timestamp.store(MonotonicNanos());
         // append params to iobuf
         size_t params_size = iobuf.size();
         closure->cntl.request_attachment().append(&params_size, sizeof(params_size));
@@ -455,6 +475,8 @@ Status SinkBuffer::_send_rpc(DisposableClosure<PTransmitChunkResult, ClosureCont
         }
         res.value()->transmit_chunk_via_http(&closure->cntl, nullptr, &closure->result, closure);
     } else {
+        // Capture serialization completion timestamp for non-HTTP path
+        closure->serialization_timestamp.store(MonotonicNanos());
         closure->cntl.request_attachment().append(request.attachment);
         request.brpc_stub->transmit_chunk(&closure->cntl, request.params.get(), &closure->result, closure);
     }
