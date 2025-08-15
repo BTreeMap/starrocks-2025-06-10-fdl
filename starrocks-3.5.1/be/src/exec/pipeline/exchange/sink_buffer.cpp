@@ -401,8 +401,7 @@ Status SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, const std::fun
             _request_sent++;
         }
 
-        auto* closure = new DisposableClosure<PTransmitChunkResult, ClosureContext>(
-                {instance_id, request.params->sequence(), MonotonicNanos(), 0});
+        auto* closure = new TimedDisposableClosure({instance_id, request.params->sequence(), MonotonicNanos()});
         if (_first_send_time == -1) {
             _first_send_time = MonotonicNanos();
         }
@@ -430,6 +429,10 @@ Status SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, const std::fun
             auto query_ctx = _fragment_ctx->runtime_state()->query_ctx();
             auto query_ctx_guard = query_ctx->shared_from_this();
             auto notify = this->defer_notify();
+        closure->addSuccessHandler([this, closure](const ClosureContext& ctx, const PTransmitChunkResult& result) noexcept {
+            auto query_ctx = _fragment_ctx->runtime_state()->query_ctx();
+            auto query_ctx_guard = query_ctx->shared_from_this();
+            auto notify = this->defer_notify();
 
             auto defer = DeferOp([this]() { --_total_in_flight_rpc; });
             Status status(result.status());
@@ -446,10 +449,13 @@ Status SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, const std::fun
                                             print_id(ctx.instance_id), dest_addr.hostname, dest_addr.port,
                                             status.message());
             } else {
+                // Access serialization timestamp from the closure
+                int64_t serialization_timestamp = closure->serialization_complete_timestamp.load();
+                
                 static_cast<void>(_try_to_send_rpc(ctx.instance_id, [&]() {
-                    if (ctx.serialization_complete_timestamp > 0) {
+                    if (serialization_timestamp > 0) {
                         _update_detailed_time(ctx.instance_id, ctx.send_timestamp, 
-                                            ctx.serialization_complete_timestamp, 
+                                            serialization_timestamp, 
                                             result.receiver_post_process_time());
                     } else {
                         _update_network_time(ctx.instance_id, ctx.send_timestamp, result.receiver_post_process_time());
@@ -458,10 +464,6 @@ Status SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, const std::fun
                 }));
             }
         });
-
-        ++_total_in_flight_rpc;
-        ++context.num_in_flight_rpcs;
-
         // Attachment will be released by process_mem_tracker in closure->Run() in bthread, when receiving the response,
         // so decrease the memory usage of attachment from instance_mem_tracker immediately before sending the request.
         _mem_tracker->release(request.attachment_physical_bytes);
@@ -486,15 +488,15 @@ Status SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, const std::fun
     return Status::OK();
 }
 
-Status SinkBuffer::_send_rpc(DisposableClosure<PTransmitChunkResult, ClosureContext>* closure,
-                             const TransmitChunkInfo& request) {
+Status SinkBuffer::_send_rpc(TimedDisposableClosure* closure, const TransmitChunkInfo& request) {
     auto expected_iobuf_size = request.attachment.size() + request.params->ByteSizeLong() + sizeof(size_t) * 2;
     if (UNLIKELY(expected_iobuf_size > _rpc_http_min_size)) {
         butil::IOBuf iobuf;
         butil::IOBufAsZeroCopyOutputStream wrapper(&iobuf);
         request.params->SerializeToZeroCopyStream(&wrapper);
-        // Capture serialization complete timestamp
-        closure->ctx.serialization_complete_timestamp = MonotonicNanos();
+        
+        // Capture serialization complete timestamp in the closure
+        closure->serialization_complete_timestamp.store(MonotonicNanos());
         
         // append params to iobuf
         size_t params_size = iobuf.size();
@@ -519,8 +521,6 @@ Status SinkBuffer::_send_rpc(DisposableClosure<PTransmitChunkResult, ClosureCont
         }
         res.value()->transmit_chunk_via_http(&closure->cntl, nullptr, &closure->result, closure);
     } else {
-        // For non-HTTP RPC, serialization happens inside BRPC, capture timestamp before
-        closure->ctx.serialization_complete_timestamp = MonotonicNanos();
         closure->cntl.request_attachment().append(request.attachment);
         request.brpc_stub->transmit_chunk(&closure->cntl, request.params.get(), &closure->result, closure);
     }
