@@ -98,7 +98,7 @@ struct DetailedTimeTrace {
 class TimedDisposableClosure : public DisposableClosure<PTransmitChunkResult, ClosureContext> {
 public:
     TimedDisposableClosure(const ClosureContext& ctx) : DisposableClosure<PTransmitChunkResult, ClosureContext>(ctx) {}
-    
+
     // Serialization timestamp captured during _send_rpc
     std::atomic<int64_t> serialization_complete_timestamp{0};
 };
@@ -141,8 +141,8 @@ private:
     void _update_network_time(const TUniqueId& instance_id, const int64_t send_timestamp,
                               const int64_t receiver_post_process_time);
     void _update_detailed_time(const TUniqueId& instance_id, const int64_t send_timestamp,
-                              const int64_t serialization_complete_timestamp, 
-                              const int64_t receiver_post_process_time);
+                               const int64_t serialization_complete_timestamp,
+                               const int64_t receiver_post_process_time);
     // Update the discontinuous acked window, here are the invariants:
     // send by rpc or http
     Status _send_rpc(TimedDisposableClosure* closure, const TransmitChunkInfo& req);
