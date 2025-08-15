@@ -45,6 +45,7 @@ struct ClosureContext {
     TUniqueId instance_id;
     int64_t sequence;
     int64_t send_timestamp;
+    int64_t serialization_complete_timestamp;
 };
 
 struct TransmitChunkInfo {
@@ -94,15 +95,6 @@ struct DetailedTimeTrace {
     }
 };
 
-// Custom closure with serialization timing support
-class TimedDisposableClosure : public DisposableClosure<PTransmitChunkResult, ClosureContext> {
-public:
-    TimedDisposableClosure(const ClosureContext& ctx) : DisposableClosure<PTransmitChunkResult, ClosureContext>(ctx) {}
-    
-    // Serialization timestamp captured during _send_rpc
-    std::atomic<int64_t> serialization_complete_timestamp{0};
-};
-
 class SinkBuffer {
 public:
     SinkBuffer(FragmentContext* fragment_ctx, const std::vector<TPlanFragmentDestination>& destinations,
@@ -144,8 +136,8 @@ private:
                               const int64_t serialization_complete_timestamp, 
                               const int64_t receiver_post_process_time);
     // Update the discontinuous acked window, here are the invariants:
-    // send by rpc or http
-    Status _send_rpc(TimedDisposableClosure* closure, const TransmitChunkInfo& req);
+    // all acks received with sequence from [0, _max_continuous_acked_seqs[x]]
+    // not all the acks received with sequence from [_max_continuous_acked_seqs[x]+1, _request_seqs[x]]
     // _discontinuous_acked_seqs[x] stored the received discontinuous acks
     void _process_send_window(const TUniqueId& instance_id, const int64_t sequence);
 
