@@ -54,6 +54,9 @@ public:
     TimedDisposableClosure(const ContextType& context) : DisposableClosure<ResultType, ContextType>(context) {}
 
     std::atomic<int64_t> serialization_timestamp{0};
+    // Total payload sizes (best-effort) for this RPC, used in per-batch stats
+    int64_t attachment_bytes{0};
+    int64_t params_bytes{0};
 };
 
 struct TransmitChunkInfo {
@@ -170,6 +173,27 @@ private:
     int64_t _detailed_serialization_time();
     int64_t _detailed_network_time();
 
+    // Per-batch timing event for low-overhead, in-memory sampling
+    struct BatchTimingEvent {
+        int64_t sequence;
+        int64_t send_ts;
+        int64_t ser_done_ts;
+        int64_t recv_ts;
+        int64_t receiver_proc_ns;
+        int64_t payload_bytes; // params + attachment if known
+    };
+
+    // Forward declare nested SinkContext for helper usage below
+    struct SinkContext;
+
+    // Record a single batch timing sample into the destination ring buffer
+    inline void _record_batch_event(struct SinkContext& ctx, const BatchTimingEvent& e) {
+        if (UNLIKELY(ctx.batch_capacity == 0 || ctx.batch_events == nullptr)) return;
+        // Relaxed ordering is sufficient: readers tolerate torn reads for best-effort telemetry
+        uint32_t idx = ctx.batch_write_idx.fetch_add(1, std::memory_order_relaxed);
+        ctx.batch_events[idx % ctx.batch_capacity] = e;
+    }
+
     FragmentContext* _fragment_ctx;
     MemTracker* const _mem_tracker;
     const int32_t _brpc_timeout_ms;
@@ -205,6 +229,11 @@ private:
         Mutex mutex;
 
         TNetworkAddress dest_addrs;
+
+    // Lock-free per-destination ring buffer for per-batch timing events
+    std::unique_ptr<BatchTimingEvent[]> batch_events;
+    uint32_t batch_capacity{1024}; // default ring size
+    std::atomic<uint32_t> batch_write_idx{0};
     };
     phmap::flat_hash_map<int64_t, std::unique_ptr<SinkContext>, StdHash<int64_t>> _sink_ctxs;
     SinkContext& sink_ctx(int64_t instance_id) { return *_sink_ctxs[instance_id]; }

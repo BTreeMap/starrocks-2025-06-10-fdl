@@ -19,6 +19,9 @@
 #include <chrono>
 #include <mutex>
 #include <string_view>
+#include <vector>
+#include <algorithm>
+#include <numeric>
 
 #include "exec/pipeline/schedule/utils.h"
 #include "fmt/core.h"
@@ -53,6 +56,9 @@ SinkBuffer::SinkBuffer(FragmentContext* fragment_ctx, const std::vector<TPlanFra
             ctx.num_finished_rpcs = 0;
             ctx.num_in_flight_rpcs = 0;
             ctx.dest_addrs = dest.brpc_server;
+            // allocate per-destination ring buffer for batch timing
+            if (ctx.batch_capacity == 0) ctx.batch_capacity = 1024;
+            ctx.batch_events = std::unique_ptr<BatchTimingEvent[]>(new BatchTimingEvent[ctx.batch_capacity]{});
 
             PUniqueId finst_id;
             finst_id.set_hi(instance_id.hi);
@@ -199,6 +205,68 @@ void SinkBuffer::update_profile(RuntimeProfile* profile) {
                 return RuntimeProfile::units_per_second(bytes_sent_counter, overall_timer);
             },
             "");
+
+    // Aggregate per-batch samples into percentiles and averages (best-effort)
+    std::vector<int64_t> samples_ser_ns;
+    std::vector<int64_t> samples_net_ns;
+    samples_ser_ns.reserve(4096);
+    samples_net_ns.reserve(4096);
+    int64_t payload_sum = 0;
+    int64_t payload_cnt = 0;
+    for (auto& [_, context] : _sink_ctxs) {
+        auto& ctx = *context;
+        const uint32_t wi = ctx.batch_write_idx.load(std::memory_order_relaxed);
+        const uint32_t cap = std::max(1u, ctx.batch_capacity);
+        const uint32_t cnt = std::min(wi, cap);
+        if (!ctx.batch_events) continue;
+        for (uint32_t i = wi - cnt; i < wi; ++i) {
+            const auto& e = ctx.batch_events[i % cap];
+            if (e.ser_done_ts == 0 || e.send_ts == 0 || e.recv_ts == 0) continue;
+            int64_t ser = e.ser_done_ts - e.send_ts;
+            int64_t net = e.recv_ts - e.ser_done_ts - e.receiver_proc_ns;
+            if (ser < 0) ser = 0;
+            if (net < 0) net = 0;
+            samples_ser_ns.push_back(ser);
+            samples_net_ns.push_back(net);
+            if (e.payload_bytes > 0) {
+                payload_sum += e.payload_bytes;
+                ++payload_cnt;
+            }
+        }
+    }
+
+    auto percentile = [](std::vector<int64_t>& v, double p) -> int64_t {
+        if (v.empty()) return 0;
+        size_t n = v.size();
+        size_t idx = static_cast<size_t>(std::clamp(p, 0.0, 100.0) / 100.0 * (n - 1));
+        std::nth_element(v.begin(), v.begin() + idx, v.end());
+        return v[idx];
+    };
+
+    int64_t ser_p50 = percentile(samples_ser_ns, 50.0);
+    int64_t ser_p95 = percentile(samples_ser_ns, 95.0);
+    int64_t ser_p99 = percentile(samples_ser_ns, 99.0);
+    int64_t net_p50 = percentile(samples_net_ns, 50.0);
+    int64_t net_p95 = percentile(samples_net_ns, 95.0);
+    int64_t net_p99 = percentile(samples_net_ns, 99.0);
+    int64_t payload_avg = payload_cnt > 0 ? payload_sum / payload_cnt : 0;
+
+    auto* batch_samples = ADD_COUNTER(profile, "BatchSamples", TUnit::UNIT);
+    COUNTER_SET(batch_samples, static_cast<int64_t>(samples_net_ns.size()));
+    auto* batch_avg_payload = ADD_COUNTER(profile, "BatchAvgPayloadBytes", TUnit::BYTES);
+    COUNTER_SET(batch_avg_payload, payload_avg);
+    auto* ser_p50_timer = ADD_TIMER(profile, "BatchSerializationTimeP50");
+    auto* ser_p95_timer = ADD_TIMER(profile, "BatchSerializationTimeP95");
+    auto* ser_p99_timer = ADD_TIMER(profile, "BatchSerializationTimeP99");
+    auto* net_p50_timer = ADD_TIMER(profile, "BatchNetworkTimeP50");
+    auto* net_p95_timer = ADD_TIMER(profile, "BatchNetworkTimeP95");
+    auto* net_p99_timer = ADD_TIMER(profile, "BatchNetworkTimeP99");
+    COUNTER_SET(ser_p50_timer, ser_p50);
+    COUNTER_SET(ser_p95_timer, ser_p95);
+    COUNTER_SET(ser_p99_timer, ser_p99);
+    COUNTER_SET(net_p50_timer, net_p50);
+    COUNTER_SET(net_p95_timer, net_p95);
+    COUNTER_SET(net_p99_timer, net_p99);
 }
 
 int64_t SinkBuffer::_network_time() {
@@ -280,9 +348,14 @@ void SinkBuffer::_update_detailed_time(const TUniqueId& instance_id, const int64
     // to break down NetworkTime into SerializationTime and PureNetworkTime
 
     // Calculate individual timing components
-    int64_t serialization_time = serialization_timestamp - send_timestamp;
+    int64_t serialization_time = 0;
+    if (serialization_timestamp > 0 && serialization_timestamp >= send_timestamp) {
+        serialization_time = serialization_timestamp - send_timestamp;
+    }
     int64_t total_round_trip = MonotonicNanos() - send_timestamp - receiver_post_process_time;
+    if (total_round_trip < 0) total_round_trip = 0;
     int64_t pure_network_time = total_round_trip - serialization_time;
+    if (pure_network_time < 0) pure_network_time = 0;
 
     // Update detailed timing metrics with concurrency level
     auto* sink_context = &sink_ctx(instance_id.lo);
@@ -446,6 +519,16 @@ Status SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, const std::fun
                                             print_id(ctx.instance_id), dest_addr.hostname, dest_addr.port,
                                             status.message());
             } else {
+                // Record per-batch timing sample before any further work
+                BatchTimingEvent ev{};
+                ev.sequence = ctx.sequence;
+                ev.send_ts = ctx.send_timestamp;
+                ev.ser_done_ts = closure->serialization_timestamp.load();
+                if (ev.ser_done_ts == 0) ev.ser_done_ts = ev.send_ts; // fallback for non-HTTP path
+                ev.recv_ts = MonotonicNanos();
+                ev.receiver_proc_ns = result.receiver_post_process_time();
+                ev.payload_bytes = closure->attachment_bytes + closure->params_bytes;
+                _record_batch_event(context, ev);
                 static_cast<void>(_try_to_send_rpc(ctx.instance_id, [&]() {
                     _update_detailed_time(ctx.instance_id, ctx.send_timestamp, closure->serialization_timestamp.load(),
                                           result.receiver_post_process_time());
@@ -484,7 +567,11 @@ Status SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, const std::fun
 
 Status SinkBuffer::_send_rpc(TimedDisposableClosure<PTransmitChunkResult, ClosureContext>* closure,
                              const TransmitChunkInfo& request) {
-    auto expected_iobuf_size = request.attachment.size() + request.params->ByteSizeLong() + sizeof(size_t) * 2;
+    // capture sizes for this RPC (best-effort)
+    int64_t params_size_bytes = request.params->ByteSizeLong();
+    closure->params_bytes = params_size_bytes;
+    closure->attachment_bytes = request.attachment.size();
+    auto expected_iobuf_size = request.attachment.size() + params_size_bytes + sizeof(size_t) * 2;
     if (UNLIKELY(expected_iobuf_size > _rpc_http_min_size)) {
         butil::IOBuf iobuf;
         butil::IOBufAsZeroCopyOutputStream wrapper(&iobuf);
@@ -492,8 +579,8 @@ Status SinkBuffer::_send_rpc(TimedDisposableClosure<PTransmitChunkResult, Closur
         // Capture serialization completion timestamp
         closure->serialization_timestamp.store(MonotonicNanos());
         // append params to iobuf
-        size_t params_size = iobuf.size();
-        closure->cntl.request_attachment().append(&params_size, sizeof(params_size));
+        size_t params_size_hdr = iobuf.size();
+        closure->cntl.request_attachment().append(&params_size_hdr, sizeof(params_size_hdr));
         closure->cntl.request_attachment().append(iobuf);
         // append attachment
         size_t attachment_size = request.attachment.size();
@@ -514,8 +601,9 @@ Status SinkBuffer::_send_rpc(TimedDisposableClosure<PTransmitChunkResult, Closur
         }
         res.value()->transmit_chunk_via_http(&closure->cntl, nullptr, &closure->result, closure);
     } else {
-        // Capture serialization completion timestamp for non-HTTP path
-        closure->serialization_timestamp.store(MonotonicNanos());
+    // Non-HTTP path serializes inside BRPC; we can't mark serialization end here
+    // Use 0 to indicate "unknown/skip" for serialization component.
+    closure->serialization_timestamp.store(0);
         closure->cntl.request_attachment().append(request.attachment);
         request.brpc_stub->transmit_chunk(&closure->cntl, request.params.get(), &closure->result, closure);
     }
