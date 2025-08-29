@@ -128,116 +128,111 @@ Remaining work centers on deeper phase isolation (kernel & BRPC internals), path
 
 Maintainer Guidance: Treat current detailed timing as beta; avoid over-optimizing decisions on pure_network_time until serialization timestamp parity and variance reporting are implemented.
 
-## Proposed Enhancements Roadmap (Draft)
+## Proposed Enhancements Roadmap (Pragmatic Version)
 
-This section outlines concrete improvement ideas along the two requested axes:
+Emphasis shifts from heavy measurement/benchmark scaffolding to clear, common-sense improvements that (a) keep the hot path lean and (b) provide a sharper decomposition of NetworkTime.
 
-1. Lower overhead / higher performance of instrumentation (keep hot path lean).
-2. Richer, more granular breakdown of network timing (actionable diagnostics).
+Two tracks run in parallel and stay independently toggleable:
 
-Each proposal lists: Objective, Approach, Est. Overhead Impact, Complexity, and Risks. Phases are ordered to deliver value early while containing risk.
+Track A: Lean Performance Improvements
+Track B: Deeper Timing Breakdown
 
-### Phase 0: Baseline & Guardrails (Pre‑Change)
+### Track A: Lean Performance Improvements
 
-| Item | Objective | Approach | Deliverable |
-|------|-----------|----------|-------------|
-| Microbenchmark harness | Quantify current per-RPC overhead | Add gtest / benchmark that simulates N RPC completions with/without instrumentation | `be/test/pipeline/network_time_benchmark.cpp` |
-| Config flags inventory | Centralize tunables | Introduce `config::enable_detailed_network_time` & sampling ratio | Updated `be/conf/be.conf` docs |
-| Overhead budget definition | Set target (<1% CPU) | Measure cycles added per RPC on representative payload sizes | Summary in docs |
+| Item | What Changes | Why | Effort | Risk |
+|------|--------------|-----|--------|------|
+| Single timestamp capture | Use one `now` for all deltas | Remove redundant syscalls | Low | None |
+| Unified update function | Merge detailed+legacy updates | Fewer atomics & branches | Low | Regression if logic diverges |
+| Sharded counters (power-of-two) | Array of shard structs per destination | Cut atomic contention | Med | Slight aggregation cost |
+| Fixed-ratio sampling (1/N) | Skip ring recording for most RPCs | Linear memory & write reduction | Low | Distribution accuracy depends on N |
+| Skip tiny payload events | Early return if bytes < threshold & concurrency=1 | Avoid noise in OLTP-like traffic | Low | Must track skipped count |
+| Struct-of-arrays ring buffer | Parallel arrays per field | Better cache & selective reads | Med | Code clarity |
+| Cache-line alignment | `alignas(64)` shard structs | Prevent false sharing | Low | Minor memory overhead |
+| Closure pooling (optional later) | Reuse closures | Reduce alloc churn | Med | Thread-safety correctness |
 
-### Phase 1: Instrumentation Overhead Reduction
+Minimal new flags only (avoid explosion):
+`enable_detailed_network_time`, `detailed_network_sample_n`, `detailed_network_min_payload_bytes`, `detailed_network_shards`.
 
-| Proposal | Objective | Approach | Est. Gain | Complexity | Notes |
-|----------|----------|----------|-----------|------------|-------|
-| Adaptive sampling | Reduce constant per-RPC cost | Maintain exponential moving variance of (latency, payload); sample 100% until stable then downsample to target error bound | 30–70% fewer recorded events in steady state | Medium | Must still accumulate aggregate sums accurately via scaling |
-| Per-core sharded accumulators | Lower contention on atomics | Allocate `DetailedTimeTrace` shards per CPU (or bthread key) and aggregate lazily on profile read | 10–30% less atomic traffic under high fan-out | Medium | Merge cost deferred to read path |
-| Branchless fast path | Minimize branching when disabled | Wrap detailed timing in `if (LIKELY(!enabled)) return` style early exits; ensure measurement code separate TU for inlining control | ~5–10% faster when disabled | Low | Keep flag in a hot-cache global |
-| Compact event representation | Shrink cache footprint | Use struct-of-arrays ring buffer for timestamps & payload_size (separate arrays) to reduce write bandwidth | 5–15% memory & write bandwidth reduction | Medium | Minor code complexity increase |
-| Deferred monotonic now | Avoid extra `MonotonicNanos()` | Reuse closure send_ts for event; only call another now() once (not twice) and pass to both legacy + detailed update | 1 syscall-equivalent saved per RPC | Low | Already partially done; verify duplication removal |
-| Batched atomic updates | Reduce atomic increments | Locally buffer per-RPC timing deltas in thread-local; flush every K ops or on context switch | 5–20% lower atomic overhead | Medium | Need safe flush on thread exit |
-| Static payload size thresholds | Skip small messages | If payload < configurable cutoff and network_time < small_latency_threshold, skip detailed event (still add to aggregates) | Up to 40% event skip on OLTP-like small batches | Medium | Ensure bias correction via scaling factors |
+### Track B: Deeper Timing Breakdown
 
-### Phase 2: Richer Breakdown (Application + Transport)
+Deliver increments that immediately add diagnostic value without requiring kernel tools first.
 
-| Layer | New Metric | Collection Strategy | Exposure |
-|-------|------------|---------------------|----------|
-| Serialization | `SerializationTime` parity for BRPC path | Hook / patch before BRPC encodes protobuf (custom Controller extension or trampoline into our code) | Operator profile & debug endpoint |
-| Compression | `CompressionTime` & `CompressedBytes` | Wrap codec call (if compression enabled) measure before/after | Profile child counters |
-| Copy / Buffer build | `PayloadAssemblyTime` | Time constructing IOBuf / attachments (already partially in serialization) but separate compression from pure serialization | Debug JSON only initially |
-| BRPC queue | `RpcQueueDelay` | Timestamp at enqueue + timestamp at network send callback (if accessible) | Optional, flag-guarded |
-| Kernel send queue | `KernelSendQueueDelay` | eBPF kprobe on `tcp_sendmsg` entry/exit + track time until packets acked or timestamped | Advanced diagnostics endpoint |
-| RTT estimate | `TcpSmoothedRtt` snapshot | Read from `/proc/net/tcp` or eBPF `tcp_sock` helper per connection occasionally (sampled) | Low-frequency gauge |
-| Retransmissions | `RetransmitEvents` | eBPF tracepoint `tcp_retransmit_skb` filtered by 4‑tuple | Alerting metric |
-| Receiver early queue | `ReceiverIngressDelay` | Additional field: receiver records time from socket read to start of processing (requires extra timestamp capture before heavy work) | Added to response proto next version |
-| Clock skew safety | `NegativeDerivedEvents` | Count events where computed pure_network_time < 0 before clamping | Internal counter |
+Priority tiers:
+Tier 1 (Foundational): Serialization parity (BRPC path), Compression time, Receiver ingress delay.
+Tier 2 (Refinement): Assembly/copy time, Pure network refinement (separating queue delay), RPC queue delay.
+Tier 3 (Advanced Optional): Kernel send queue delay, retransmissions, RTT sampling.
 
-### Phase 3: Analytical & User-Facing Enhancements
+| Metric | Tier | Capture Point | Notes |
+|--------|------|---------------|-------|
+| SerializationTime | 1 | After protobuf encode (HTTP & BRPC hook) | Parity with HTTP path |
+| CompressionTime | 1 | Wrap compression codec call | Only if compression enabled |
+| ReceiverIngressDelay | 1 | Receiver: socket read to start of processing | New proto optional field |
+| PureNetworkTime (refined) | 2 | Use send_wire_ts if available else send_ts | Subtract serialization+receiver_proc |
+| AssemblyTime | 2 | Time building attachments/iobuf | Distinguish from serialization |
+| RpcQueueDelay | 2 | BRPC enqueue to send start | If BRPC exposes hook |
+| KernelSendQueueDelay | 3 | eBPF tcp_sendmsg vs. ack | Advanced |
+| RetransmitEvents | 3 | eBPF tracepoint | Alert metric |
+| TcpSmoothedRtt | 3 | Periodic socket read / eBPF | Sampled |
 
-| Feature | Description | Benefit |
-|---------|-------------|---------|
-| Percentile snapshotting | Reservoir or CKMS sketch over pure network & serialization times | Surface P50/P95 in profiles w/out storing all samples |
-| Anomaly tagging | Flag events > (median + N*IQR) | Immediate visibility into outliers (e.g., pauses) |
-| Auto-advice engine | Heuristics: if SerializationTime/PureNetworkTime > ratio threshold -> recommend compression toggle | Guided tuning |
-| System table (`information_schema.network_time_samples`) | Expose rolling window | SQL-based troubleshooting |
-| Debug REST endpoint | `/api/debug/network_time?fragment=<id>` returns JSON of last N events | Integrates with external tooling |
+### Data Structure (Succinct Sketch)
 
-### Data Structures & Algorithmic Adjustments
+```cpp
+struct alignas(64) ShardTrace {
+      std::atomic<int64_t> ser_ns{0};
+      std::atomic<int64_t> comp_ns{0};
+      std::atomic<int64_t> assembly_ns{0};
+      std::atomic<int64_t> pure_net_ns{0};
+      std::atomic<int64_t> ingress_ns{0};
+      std::atomic<int64_t> receiver_proc_ns{0};
+      std::atomic<int64_t> samples{0};
+      std::atomic<int64_t> max_pure_net_ns{0};
+      std::atomic<int64_t> max_ser_ns{0};
+};
+```
 
-- Ring Buffer Upgrade: Convert from single ring per destination to (destination x shard) ring to reduce false sharing; expose consumer API for snapshot.
-- Accurate Scaling for Sampling: Maintain unsampled aggregate counters (sums, counts) separately from sampled distribution to avoid skew.
-- Variance-Guided Sampling: Adjust sampling probability p such that relative standard error (RSE) target (e.g., <5%) is met: `p = min(1, (sigma^2 / (epsilon^2 * mu^2 * n_total)))`.
-- Cache-Line Alignment: Align frequently written structs (`DetailedTimeTrace` shards) to 64 bytes; pack rarely-updated fields elsewhere.
-- Monotonic Clock Batch: Provide inline `FastNow()` that caches `MonotonicNanos()` result per bthread iteration if multiple metrics need same tick.
+Shard selection: `shard = seq & (num_shards - 1)`. Aggregation only when profile printed.
 
-### API / Proto Evolution Plan
+### Output Format (Profile Snippet Draft)
 
-| Version | Change | Compatibility Strategy |
-|---------|--------|------------------------|
-| v1 (current) | `receiver_post_process_time` | Baseline |
-| v2 | Add optional `receiver_ingress_delay` | Backward compatible (optional field) |
-| v2 | Add `serialization_complete_ts` on receiver (optional) | Only filled if enable flag set |
-| v3 (optional) | Structured multi-phase timing message `PNetworkTimingDetail` with repeated key/value pairs | Sender falls back to legacy if field absent |
+```text
+NetworkTimeBreakdown (sampled 1/N=Nval, skipped_small=K):
+   SerializationTime:  X ms (avg)  max=Y ms
+   CompressionTime:    X ms (avg)
+   AssemblyTime:       X ms (avg)
+   PureNetworkTime:    X ms (avg)  max=Y ms
+   ReceiverIngress:    X ms (avg)
+   ReceiverProc:       X ms (avg)
+```
 
-### Configuration Additions (Draft)
+### Incremental Execution Plan (Concrete Patches)
 
-| Config Key | Type | Default | Purpose |
-|------------|------|---------|---------|
-| `enable_detailed_network_time` | bool | true | Master switch for current decomposition |
-| `network_time_sample_ratio` | double | 1.0 | Global sampling probability for batch events |
-| `network_time_adaptive_sampling` | bool | true | Enable dynamic sampling control |
-| `network_time_target_rse_pct` | double | 5.0 | Target relative std error for latency estimates |
-| `network_time_min_payload_bytes_for_event` | int | 0 | Skip very small payloads below threshold |
-| `network_time_enable_ebpf` | bool | false | Gate kernel/eBPF instrumentation |
-| `network_time_ring_shards` | int | 4 | Number of per-destination shard buffers |
+1. Core fast-path: timestamp reuse + unified update + sampling guard + skipped counter.
+2. Sharded counters & aggregation util (no new metrics yet).
+3. BRPC serialization timestamp parity + baseline SerializationTime exposure.
+4. CompressionTime & AssemblyTime separation (if compression enabled code path present).
+5. ReceiverIngressDelay proto addition (optional field) + profile line.
+6. Advanced (only if needed): RpcQueueDelay; else stop.
+7. Optional kernel/eBPF metrics behind single master flag.
 
-### Expected Overhead Model (Illustrative)
+Each step small & self-contained; can be reverted independently.
 
-| Component | Current (ns per RPC) | Optimized Target | Notes |
-|-----------|----------------------|------------------|-------|
-| 2× `MonotonicNanos()` | ~140 | 70 | Reuse timestamp / batch calls |
-| Atomic increments (3–4) | 80–120 | 40–60 | Sharded + batched flush |
-| Ring buffer write | 90 | 50 | SOA + sampling |
-| Total incremental | 310–350 | 160–200 | Goal < 1% typical RPC budget |
+### Risks & Simple Mitigations
 
-### Risk & Mitigation
+| Risk | Mitigation |
+|------|-----------|
+| Sampling hides tail | Track max_* counters unsampled |
+| Shard count misconfigured | Clamp to power-of-two within safe bounds |
+| Proto bloat | Keep new fields optional & flag-gated |
+| Added branches degrade codegen | Use LIKELY/UNLIKELY and inline functions |
 
-| Risk | Impact | Mitigation |
-|------|--------|-----------|
-| Sampling biases aggregate | Misleading latency averages | Maintain unsampled sum/count; only sample for distribution |
-| eBPF destabilizes nodes | Kernel crashes / perf hit | Off by default; runtime safety checks; version guard |
-| Added proto fields increase wire size | Slight overhead | Fields optional; only set when enabled |
-| Sharding complicates lifecycle | Memory leaks or stale shards | RAII wrapper; aggregate on destruction |
-| Over-instrumentation in hot path | Latency regression | Feature flags + CI microbench gating |
+### Quick Wins List (Immediate)
 
-### Incremental Delivery Plan
+1. Unify timing updates.
+2. Add sample-N skip.
+3. Add small-payload skip + counter.
+4. Add shard skeleton (even if shard=1 initially) for future scaling.
 
-1. (P0) Benchmark harness + config flags + timestamp reuse.
-2. (P1a) Sharded accumulators + adaptive sampling (static heuristics first).
-3. (P1b) Percentile sketch (CKMS) integrated into profile printing.
-4. (P2a) BRPC path serialization hook; achieve parity across transport paths.
-5. (P2b) Optional receiver ingress delay proto field.
-6. (P2c) Payload/compression timing separation.
-7. (P3) eBPF optional module + debug endpoint + system table.
+After these, reassess need for deeper tracking before adding complexity.
 
 ### Acceptance Criteria (Per Phase)
 
