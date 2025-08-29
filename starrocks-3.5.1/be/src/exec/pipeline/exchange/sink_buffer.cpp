@@ -16,12 +16,12 @@
 
 #include <bthread/bthread.h>
 
+#include <algorithm>
 #include <chrono>
 #include <mutex>
+#include <numeric>
 #include <string_view>
 #include <vector>
-#include <algorithm>
-#include <numeric>
 
 #include "exec/pipeline/schedule/utils.h"
 #include "fmt/core.h"
@@ -193,6 +193,17 @@ void SinkBuffer::update_profile(RuntimeProfile* profile) {
     COUNTER_SET(bytes_unsent_counter, _bytes_enqueued - _bytes_sent);
     COUNTER_SET(request_unsent_counter, _request_enqueued - _request_sent);
 
+    // Aggregated sampling stats
+    auto* sampled_events_counter = ADD_COUNTER(profile, "NetworkTimeSampledEvents", TUnit::UNIT);
+    auto* skipped_small_counter = ADD_COUNTER(profile, "NetworkTimeSkippedSmall", TUnit::UNIT);
+    auto* skipped_sampling_counter = ADD_COUNTER(profile, "NetworkTimeSkippedSampling", TUnit::UNIT);
+    auto* anomaly_events_counter = ADD_COUNTER(profile, "NetworkTimeAnomalies", TUnit::UNIT);
+
+    COUNTER_SET(sampled_events_counter, _global_sampled_events.load());
+    COUNTER_SET(skipped_small_counter, _global_skipped_small.load());
+    COUNTER_SET(skipped_sampling_counter, _global_skipped_sampling.load());
+    COUNTER_SET(anomaly_events_counter, _global_anomalies.load());
+
     profile->add_derived_counter(
             "NetworkBandwidth", TUnit::BYTES_PER_SECOND,
             [bytes_sent_counter, network_timer] {
@@ -329,39 +340,7 @@ void SinkBuffer::cancel_one_sinker(RuntimeState* const state) {
     }
 }
 
-void SinkBuffer::_update_network_time(const TUniqueId& instance_id, const int64_t send_timestamp,
-                                      const int64_t receiver_post_process_time) {
-    auto& context = sink_ctx(instance_id.lo);
-    const int64_t get_response_timestamp = MonotonicNanos();
-    _last_receive_time = get_response_timestamp;
-    int32_t concurrency = context.num_in_flight_rpcs;
-    int64_t time_usage = get_response_timestamp - send_timestamp - receiver_post_process_time;
-    context.network_time.update(time_usage, concurrency);
-    _rpc_cumulative_time += time_usage;
-    _rpc_count++;
-}
-
-void SinkBuffer::_update_detailed_time(const TUniqueId& instance_id, const int64_t send_timestamp,
-                                       const int64_t serialization_timestamp,
-                                       const int64_t receiver_post_process_time) {
-    // This method implements the "single-way time decomposition" enhancement
-    // to break down NetworkTime into SerializationTime and PureNetworkTime
-
-    // Calculate individual timing components
-    int64_t serialization_time = 0;
-    if (serialization_timestamp > 0 && serialization_timestamp >= send_timestamp) {
-        serialization_time = serialization_timestamp - send_timestamp;
-    }
-    int64_t total_round_trip = MonotonicNanos() - send_timestamp - receiver_post_process_time;
-    if (total_round_trip < 0) total_round_trip = 0;
-    int64_t pure_network_time = total_round_trip - serialization_time;
-    if (pure_network_time < 0) pure_network_time = 0;
-
-    // Update detailed timing metrics with concurrency level
-    auto* sink_context = &sink_ctx(instance_id.lo);
-    int32_t concurrency = sink_context->num_in_flight_rpcs.load();
-    sink_context->detailed_time.update(serialization_time, pure_network_time, concurrency);
-}
+// (Deprecated) _update_network_time and _update_detailed_time replaced by _update_all_timing
 
 void SinkBuffer::_process_send_window(const TUniqueId& instance_id, const int64_t sequence) {
     // Both sender side and receiver side can tolerate disorder of tranmission
@@ -519,22 +498,53 @@ Status SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, const std::fun
                                             print_id(ctx.instance_id), dest_addr.hostname, dest_addr.port,
                                             status.message());
             } else {
-                // Record per-batch timing sample before any further work
-                BatchTimingEvent ev{};
-                ev.sequence = ctx.sequence;
-                ev.send_ts = ctx.send_timestamp;
-                ev.ser_done_ts = closure->serialization_timestamp.load();
-                if (ev.ser_done_ts == 0) ev.ser_done_ts = ev.send_ts; // fallback for non-HTTP path
-                ev.recv_ts = MonotonicNanos();
-                ev.receiver_proc_ns = result.receiver_post_process_time();
-                ev.payload_bytes = closure->attachment_bytes + closure->params_bytes;
-                _record_batch_event(context, ev);
-                static_cast<void>(_try_to_send_rpc(ctx.instance_id, [&]() {
-                    _update_detailed_time(ctx.instance_id, ctx.send_timestamp, closure->serialization_timestamp.load(),
-                                          result.receiver_post_process_time());
-                    _update_network_time(ctx.instance_id, ctx.send_timestamp, result.receiver_post_process_time());
-                    _process_send_window(ctx.instance_id, ctx.sequence);
-                }));
+                const int64_t response_ts = MonotonicNanos();
+                const int64_t ser_ts = closure->serialization_timestamp.load();
+                const int64_t recv_proc = result.receiver_post_process_time();
+
+                // Unified timing update
+                _update_all_timing(ctx.instance_id, ctx.send_timestamp, ser_ts, recv_proc, response_ts);
+
+                // Decide if we record a sample (sampling + payload threshold)
+                bool record_event = true;
+                if (UNLIKELY(!config::enable_detailed_network_time)) {
+                    record_event = false;
+                }
+                if (record_event && config::detailed_network_min_payload_bytes > 0) {
+                    int64_t payload = closure->attachment_bytes + closure->params_bytes;
+                    if (payload < config::detailed_network_min_payload_bytes) record_event = false;
+                }
+                if (record_event && config::detailed_network_sample_n > 1) {
+                    // Simple modulus sampling on sequence
+                    if ((ctx.sequence % config::detailed_network_sample_n) != 0) record_event = false;
+                }
+                if (record_event) {
+                    BatchTimingEvent ev{};
+                    ev.sequence = ctx.sequence;
+                    ev.send_ts = ctx.send_timestamp;
+                    ev.ser_done_ts = ser_ts == 0 ? ctx.send_timestamp : ser_ts;
+                    ev.recv_ts = response_ts;
+                    ev.receiver_proc_ns = recv_proc;
+                    ev.payload_bytes = closure->attachment_bytes + closure->params_bytes;
+                    ev.concurrency_at_send = context.num_in_flight_rpcs.load();
+                    if (closure->serialization_timestamp.load() != 0) ev.flags |= 0x1; // http_path
+                    if (request.params->eos()) ev.flags |= 0x8; // eos
+                    // compression flag left for future when compression timing separated
+                    _record_batch_event(context, ev);
+                    context.sampled_events++; _global_sampled_events++;
+                    if (UNLIKELY(ev.ser_done_ts < ev.send_ts)) { context.anomaly_events++; _global_anomalies++; }
+                } else {
+                    // update skip stats
+                    if (config::detailed_network_min_payload_bytes > 0 &&
+                        (closure->attachment_bytes + closure->params_bytes) < config::detailed_network_min_payload_bytes) {
+                        context.skipped_small_payload++; _global_skipped_small++;
+                    } else if (config::detailed_network_sample_n > 1) {
+                        context.skipped_sampling++; _global_skipped_sampling++;
+                    }
+                }
+
+                static_cast<void>(_try_to_send_rpc(ctx.instance_id,
+                                                   [&]() { _process_send_window(ctx.instance_id, ctx.sequence); }));
             }
         });
 
@@ -601,9 +611,9 @@ Status SinkBuffer::_send_rpc(TimedDisposableClosure<PTransmitChunkResult, Closur
         }
         res.value()->transmit_chunk_via_http(&closure->cntl, nullptr, &closure->result, closure);
     } else {
-    // Non-HTTP path serializes inside BRPC; we can't mark serialization end here
-    // Use 0 to indicate "unknown/skip" for serialization component.
-    closure->serialization_timestamp.store(0);
+        // Non-HTTP path serializes inside BRPC; we can't mark serialization end here
+        // Use 0 to indicate "unknown/skip" for serialization component.
+        closure->serialization_timestamp.store(0);
         closure->cntl.request_attachment().append(request.attachment);
         request.brpc_stub->transmit_chunk(&closure->cntl, request.params.get(), &closure->result, closure);
     }

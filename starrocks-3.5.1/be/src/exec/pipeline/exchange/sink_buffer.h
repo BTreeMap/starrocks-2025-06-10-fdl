@@ -141,11 +141,27 @@ public:
 private:
     using Mutex = bthread::Mutex;
 
-    void _update_network_time(const TUniqueId& instance_id, const int64_t send_timestamp,
-                              const int64_t receiver_post_process_time);
+    // Legacy per-metric update helpers removed in favor of unified _update_all_timing
 
-    void _update_detailed_time(const TUniqueId& instance_id, const int64_t send_timestamp,
-                               const int64_t serialization_timestamp, const int64_t receiver_post_process_time);
+    // Unified fast-path update performing both detailed and legacy network time updates with a single response timestamp.
+    inline void _update_all_timing(const TUniqueId& instance_id, const int64_t send_ts, const int64_t serialization_ts,
+                                   const int64_t receiver_proc_ns, const int64_t response_ts) {
+        auto& context = sink_ctx(instance_id.lo);
+        _last_receive_time = response_ts;
+        int32_t concurrency = context.num_in_flight_rpcs.load();
+        // Legacy network time (includes serialization) calculation
+        int64_t network_usage = response_ts - send_ts - receiver_proc_ns;
+        if (network_usage < 0) network_usage = 0;
+        context.network_time.update(network_usage, concurrency);
+        _rpc_cumulative_time += network_usage;
+        _rpc_count++;
+        // Detailed split
+        int64_t serialization_time = 0;
+        if (serialization_ts > 0 && serialization_ts >= send_ts) serialization_time = serialization_ts - send_ts;
+        int64_t pure_network = network_usage - serialization_time;
+        if (pure_network < 0) pure_network = 0;
+        context.detailed_time.update(serialization_time, pure_network, concurrency);
+    }
 
     // Update the discontinuous acked window, here are the invariants:
     // all acks received with sequence from [0, _max_continuous_acked_seqs[x]]
@@ -181,6 +197,9 @@ private:
         int64_t recv_ts;
         int64_t receiver_proc_ns;
         int64_t payload_bytes; // params + attachment if known
+    int32_t concurrency_at_send{0};
+    uint16_t flags{0}; // bit0:http_path bit1:sampled bit2:compressed bit3:eos
+    uint16_t reserved{0};
     };
 
     // Forward declare nested SinkContext for helper usage below
@@ -225,15 +244,20 @@ private:
         std::atomic_size_t num_in_flight_rpcs;
         TimeTrace network_time;
         DetailedTimeTrace detailed_time;
+    // Sampling / skip stats
+    std::atomic<int64_t> sampled_events{0};
+    std::atomic<int64_t> skipped_small_payload{0};
+    std::atomic<int64_t> skipped_sampling{0};
+    std::atomic<int64_t> anomaly_events{0}; // e.g. ser_done < send
 
         Mutex mutex;
 
         TNetworkAddress dest_addrs;
 
-    // Lock-free per-destination ring buffer for per-batch timing events
-    std::unique_ptr<BatchTimingEvent[]> batch_events;
-    uint32_t batch_capacity{1024}; // default ring size
-    std::atomic<uint32_t> batch_write_idx{0};
+        // Lock-free per-destination ring buffer for per-batch timing events
+        std::unique_ptr<BatchTimingEvent[]> batch_events;
+        uint32_t batch_capacity{1024}; // default ring size
+        std::atomic<uint32_t> batch_write_idx{0};
     };
     phmap::flat_hash_map<int64_t, std::unique_ptr<SinkContext>, StdHash<int64_t>> _sink_ctxs;
     SinkContext& sink_ctx(int64_t instance_id) { return *_sink_ctxs[instance_id]; }
@@ -257,6 +281,11 @@ private:
 
     std::atomic<int64_t> _rpc_count = 0;
     std::atomic<int64_t> _rpc_cumulative_time = 0;
+    // Global counters for all destinations (aggregated)
+    std::atomic<int64_t> _global_sampled_events{0};
+    std::atomic<int64_t> _global_skipped_small{0};
+    std::atomic<int64_t> _global_skipped_sampling{0};
+    std::atomic<int64_t> _global_anomalies{0};
 
     // RuntimeProfile counters
     std::atomic<int64_t> _bytes_enqueued = 0;

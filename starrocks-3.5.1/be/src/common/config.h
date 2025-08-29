@@ -865,6 +865,15 @@ CONF_Int64(pipeline_sink_io_thread_pool_queue_size, "102400");
 CONF_Int64(pipeline_sink_buffer_size, "64");
 // The degree of parallelism of brpc.
 CONF_Int64(pipeline_sink_brpc_dop, "64");
+// ---- Detailed Network Time instrumentation controls ----
+// Master switch to enable/disable detailed decomposition (serialization/pure network, ring buffer samples)
+CONF_Bool(enable_detailed_network_time, "true");
+// Record 1 out of every N RPC events (1 means record all)
+CONF_Int64(detailed_network_sample_n, "1");
+// Skip recording detailed event if total payload (params+attachment) below this threshold (bytes)
+CONF_Int64(detailed_network_min_payload_bytes, "0");
+// Number of shards per destination for future sharded counters (power of two, minimum 1). Currently placeholder.
+CONF_Int64(detailed_network_shards, "1");
 // Used to reject coming fragment instances, when the number of running drivers
 // exceeds it*pipeline_exec_thread_pool_thread_num.
 CONF_Int64(pipeline_max_num_drivers_per_exec_thread, "10240");
